@@ -15,7 +15,7 @@ ticket ──► classifier ──► researcher ──► responder ──► q
 
 ---
 
-> 🤖 **Using an AI coding agent** (Claude Code, Cursor, Codex, Copilot)? Ask it to "set up and run this demo". [AGENTS.md](AGENTS.md) tells it how to do that safely. You still paste the keys into `.env` yourself.
+> 🤖 **Prefer to let an AI coding agent do the setup?** See [Set up with an AI coding agent](#set-up-with-an-ai-coding-agent).
 
 ---
 
@@ -123,6 +123,44 @@ Metering OK: sent=4 failed=0 unsent=0 (run run-20261110-141502-a1b2)
 - **The `Outcomes` row reads `on (...)`.** If it says `OFF` or `WARNING`, fix `REVENIUM_WRITE_API_KEY` in `.env`.
 
 The preflight block always prints **before any paid call**, and it only ever shows the first and last 4 characters of a key.
+
+---
+
+## Set up with an AI coding agent
+
+Instead of following the steps above by hand, you can ask an AI coding agent (Claude Code, Cursor, OpenAI Codex, GitHub Copilot and similar) to do them. The repo includes instructions written for agents:
+
+- **[`AGENTS.md`](AGENTS.md)** holds the setup procedure, how to judge whether a run worked, and how to diagnose failures. It also sets safety rules: the agent never handles your API keys, asks before every paid run, and doesn't change the demo code.
+- **[`CLAUDE.md`](CLAUDE.md)** contains one line that points Claude Code at `AGENTS.md`.
+
+### How to use it
+
+1. **Open your agent in the project folder** (the folder that contains this README):
+   - **Claude Code:** run `claude` in a terminal in the project folder.
+   - **Codex CLI:** run `codex` in a terminal in the project folder.
+   - **Cursor / VS Code with Copilot:** open the project folder, then open the agent or chat panel in agent mode.
+
+2. **Paste this prompt:**
+
+   ```
+   Read AGENTS.md and follow it to set up and run this demo for me.
+   ```
+
+   Starting with "Read AGENTS.md" makes the prompt work whether or not your tool loads the file automatically.
+
+3. **The agent prepares everything except your keys.** It checks your Python version, creates the virtual environment, installs dependencies and creates `.env`.
+
+4. **Paste your four keys into `.env` yourself** when the agent asks (see [Step 3](#step-3-fill-in-the-four-keys)). Then tell the agent you're done.
+   > 🔒 Never paste API keys into the chat. A well-behaved agent following `AGENTS.md` won't ask for them. If one does, decline and edit `.env` yourself.
+
+5. **Approve the paid runs.** The agent asks before each one:
+   - `--check` first: 4 tiny calls
+   - then a short run (`--tickets 2`)
+   - then the full run
+
+6. **Read the agent's report.** It gives you the Run ID and the "Where to look in Revenium" hints. Open the Revenium dashboard yourself to see the results (see [See it in Revenium](#see-it-in-revenium)).
+
+If something fails, the agent matches the error against the [Troubleshooting](#troubleshooting) table and tells you what to change in `.env`.
 
 ---
 
