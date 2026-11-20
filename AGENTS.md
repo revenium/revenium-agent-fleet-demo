@@ -68,6 +68,15 @@ Give the person:
 
 Data appears in the Revenium dashboard about one minute after the run. The person checks the dashboard. You cannot see it.
 
+## Insights load mode (only when the person asks for it)
+
+`python run_fleet.py --insights-load --rounds N` generates deliberately wasteful traffic so Revenium AI Insights has something to find. See [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md).
+
+- Run `--insights-load` only after the person agrees. Quote the call count first: each round makes 29 calls, and the preflight's `Estimated calls` line shows the exact total.
+- In this mode, yellow `✗ (expected)` lines and `max_tokens` warnings are deliberate. They are not failures.
+- Success is the same as for the fleet: exit code `0`, with `Metering OK` as the last line.
+- Never install cron or any other scheduled job unless the person explicitly asks for it. Every scheduled run spends money (hard rule 4).
+
 ## If asked how the integration works
 
 All Revenium code is in [`fleet/llm.py`](fleet/llm.py):

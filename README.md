@@ -230,6 +230,12 @@ Data appears in Revenium about **1 minute** after the run. Copy the **Run ID** f
 
 ---
 
+## Surfacing Revenium AI Insights (optional)
+
+A quiet test tenant gives Revenium AI Insights nothing to find. `python run_fleet.py --insights-load --rounds 2` runs an opt-in load profile of deliberately wasteful, labelled patterns (retries, errors, cut-off replies, oversized and outdated models, a repeated large prompt, redundant agent calls). It is capped at 10 rounds and prints the exact call count before any paid call. [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md) maps each Insights investigator to a pattern and explains scheduling over several days, triggering an Insights run, and porting to AWS Bedrock.
+
+---
+
 ## How the Revenium integration works
 
 All of it is in [`fleet/llm.py`](fleet/llm.py). Three pieces matter:
@@ -273,6 +279,7 @@ The rest of the code is plain Python that you can read top to bottom:
 | [`fleet/llm.py`](fleet/llm.py) | **All Revenium code**: metering, metadata, tools, outcomes |
 | [`fleet/config.py`](fleet/config.py) | Which model each agent uses |
 | [`fleet/data.py`](fleet/data.py) | Fictional customers, tickets, knowledge base and CRM records |
+| [`fleet/insights_load.py`](fleet/insights_load.py) | Optional Insights load profile: labelled waste patterns, metered through `fleet/llm.py` |
 
 No agent framework is used. Prompts and replies are **never sent to Revenium**, because `REVENIUM_CAPTURE_PROMPTS=false`. Only token counts and metadata are sent.
 
@@ -308,5 +315,6 @@ Still stuck? Set `REVENIUM_LOG_LEVEL=DEBUG` in `.env` and run `python run_fleet.
 python run_fleet.py               # full demo: 9 tickets through 4 agents
 python run_fleet.py --tickets 2   # only the first 2 tickets
 python run_fleet.py --check       # setup check: one short call per model
+python run_fleet.py --insights-load --rounds 2   # optional: Insights load profile, 29 calls per round (max 10 rounds)
 python run_fleet.py --help        # all options
 ```
