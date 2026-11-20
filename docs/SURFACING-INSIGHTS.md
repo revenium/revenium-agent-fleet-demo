@@ -9,7 +9,7 @@ This repo offers two tools:
 
 ## Seed synthetic Insights data (recommended)
 
-`seed_insights.py` builds synthetic completion records and posts them to the Revenium metering API with the metering key the demo already uses (`REVENIUM_METERING_API_KEY`). It makes no LLM calls and needs no provider keys. Timestamps are backdated up to 90 days, so the time-series investigators get their history in one run.
+`seed_insights.py` builds synthetic completion records and posts them to the Revenium metering API with the metering key the demo already uses (`REVENIUM_METERING_API_KEY`). `--verify` uses the `rev_sk_` write key (`REVENIUM_WRITE_API_KEY`). It makes no LLM calls and needs no provider keys. Timestamps are backdated up to 90 days, so the time-series investigators get their history in one run.
 
 > **Warning: `--fire` writes synthetic spend into your tenant.** A full run sends **6,416 records with about $1,800 of synthetic spend at list prices**. That spend appears in the tenant's cost dashboards, customer reports and model reports, exactly like real usage. This tool cannot delete it. **Use a sandbox tenant, never production.**
 
@@ -27,7 +27,7 @@ This repo offers two tools:
    python seed_insights.py --fire
    ```
 
-3. **Verify.** Starts an Insights run and reports which scenarios produced findings.
+3. **Verify.** Starts an Insights run and reports which scenarios produced findings. It uses the `rev_sk_` write key.
 
    ```bash
    python seed_insights.py --verify --tag <tag printed by --fire>
@@ -92,7 +92,7 @@ You can list the investigators your tenant runs with the Revenium API/MCP tool `
 - prints the finding categories and a FOUND / not found line per selected scenario
 - exits `0` when the run completes, even if some scenarios are not found
 
-It authenticates with `REVENIUM_INSIGHTS_API_KEY` when set, otherwise with the metering key. If the Insights API rejects the metering key, set `REVENIUM_INSIGHTS_API_KEY` to a key that can start Insights runs.
+`--verify` authenticates with the `rev_sk_` write key, `REVENIUM_WRITE_API_KEY`. Set `REVENIUM_INSIGHTS_API_KEY` only to use a different key. The metering key is never used here, because starting an Insights run needs a write key and the metering key gets HTTP 403. If the key does not start with `rev_sk_`, the script prints a warning with the masked key. On a 403, use a `rev_sk_` write key from the same tenant, or start the run from the Insights page in the Revenium app.
 
 Period guidance:
 
@@ -101,7 +101,7 @@ Period guidance:
 - For `fan-out`, verify again after the next full UTC hour.
 - Do not filter the run by organization; that removes the customer-concentration signal.
 
-**In the Revenium app:** open AI Insights, start a new run over the same period, and leave the organization filter empty. Labels in the app may differ from the ones used here.
+**In the Revenium app:** open the Insights page and start a run over the last 30 days with no filters. Leave the organization filter empty. This needs no API key. Labels in the app may differ from the ones used here.
 
 **Through the Revenium API / MCP tools:** call `manage_ai_insights` with action `trigger_run`, `period_start` and `period_end` (ISO 8601 or `yyyy-MM-dd`, UTC), and optional filters such as `filter_environment` (`insights-seed`) or `filter_trace_type`. The run is asynchronous: poll `get_ai_insights` with action `get_run` and the returned `run_id` until the status is `completed`, `partial`, `failed` or `cancelled`, then read the findings. Check the current parameter schema first, for example with `tool_introspection`, action `get_tool_metadata`.
 

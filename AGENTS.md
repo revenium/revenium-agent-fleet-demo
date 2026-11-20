@@ -77,6 +77,7 @@ Two tools give Revenium AI Insights something to find. See [docs/SURFACING-INSIG
 - The dry run (no flags) is free and safe. It sends nothing.
 - `--fire` makes no LLM calls and costs no provider money, but it writes 6,416 synthetic records with about $1,800 of synthetic list-price spend into the person's Revenium tenant. That spend shows up in cost dashboards and cannot be removed with this tool. Ask first, recommend a sandbox tenant, and pass `--yes` only after the person agrees (non-interactive shells need it).
 - `--verify` starts an Insights run in the tenant. Ask first.
+- `--verify` needs the `rev_sk_` write key (`REVENIUM_WRITE_API_KEY`). A 403 means the wrong key: tell the person to put the `rev_sk_` write key from the same tenant in `.env`, or to start the run from the Insights page in the Revenium app (last 30 days, no filters).
 - Report the FOUND / not found lines as printed. Not found is not a failure.
 - Never re-run `--fire` to make a finding appear: each run adds another full set of synthetic spend.
 

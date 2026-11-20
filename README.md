@@ -232,7 +232,52 @@ Data appears in Revenium about **1 minute** after the run. Copy the **Run ID** f
 
 ## Surfacing Revenium AI Insights (optional)
 
-A quiet test tenant gives Revenium AI Insights nothing to find. `python seed_insights.py` is a dry run that shows the synthetic, backdated metering records it would send to reach each Insights investigator's minimum volumes (no LLM calls). `python seed_insights.py --fire` sends them, and `python seed_insights.py --verify` starts an Insights run and reports which scenarios produced findings. **`--fire` adds about $1,800 of synthetic spend to the tenant's dashboards that cannot be deleted, so use a sandbox tenant.** To see the same patterns on real, paid LLM calls, `python run_fleet.py --insights-load --rounds 2` runs an opt-in load profile (29 calls per round, capped at 10 rounds). [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md) maps each investigator to a seeded scenario, explains how to check the results, and covers AWS Bedrock.
+A quiet test tenant gives Revenium AI Insights nothing to find. `seed_insights.py` sends synthetic, backdated metering records sized to reach each Insights investigator's minimums. It makes no LLM calls and costs no provider money.
+
+> **Warning: use a sandbox tenant.** `--fire` writes 6,416 records with about $1,800 of synthetic spend. That spend shows in the tenant's cost dashboards, and it cannot be deleted.
+
+Each step uses a different key:
+
+| Step | Key |
+|---|---|
+| Dry run | No key needed |
+| `--fire` | `REVENIUM_METERING_API_KEY`, the metering key (`hak_` or `rev_`) |
+| `--verify` | `REVENIUM_WRITE_API_KEY`, the `rev_sk_` write key |
+| `--verify` (optional override) | `REVENIUM_INSIGHTS_API_KEY`, used instead of the write key when set |
+
+The metering key cannot start Insights runs.
+
+1. **Dry run.** Free. It sends nothing and prints each scenario's record count and estimated spend.
+
+   ```bash
+   python seed_insights.py
+   ```
+
+2. **Send the records.** Type `yes` when asked, or add `--yes` in a non-interactive shell. At the default 10 records per second, this takes about 11 minutes. Success is `Seed delivery: ok=6416 failed=0 (tag seed-...)` and exit code `0`. Note the tag. The script also prints the next command.
+
+   ```bash
+   python seed_insights.py --fire
+   ```
+
+3. **Wait.** Fan-out is computed hourly, so verify after the next full UTC hour.
+
+4. **Verify.** This starts an Insights run with the `rev_sk_` write key and polls for up to 20 minutes.
+
+   ```bash
+   python seed_insights.py --verify --tag <tag printed by --fire>
+   ```
+
+   Success is a `FOUND` or `not found` line per scenario, then `Insights verify: N of 13 seeded scenarios produced findings`, and exit code `0`. Not found is not a failure: Revenium does not publish the exact thresholds.
+
+5. **If per-call scenarios are missing,** verify over the last 7 days:
+
+   ```bash
+   python seed_insights.py --verify --period-days 7 --tag <tag>
+   ```
+
+**No write key, or a 403?** Start the run from the Insights page in the Revenium app instead, over the last 30 days with no filters. Do not filter by organization.
+
+To see the same patterns on real, paid LLM calls, `python run_fleet.py --insights-load --rounds 2` runs an opt-in load profile (29 calls per round, capped at 10 rounds). [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md) maps each investigator to a seeded scenario, explains how to check the results, and covers AWS Bedrock.
 
 ---
 
@@ -303,6 +348,7 @@ No agent framework is used. Prompts and replies are **never sent to Revenium**, 
 | The preflight `Outcomes` row says `WARNING ... does not start with rev_sk_` | You pasted the metering key (or another key) into the write-key slot | Use the separate **write-scope** key that starts with `rev_sk_` |
 | `Outcome reporting failed ... 403` | The write key lacks write permission, or `REVENIUM_TEAM_ID` names a different team | Use a `rev_sk_` write key from the same tenant as the metering key, and leave `REVENIUM_TEAM_ID` empty |
 | `Outcome reporting failed ... Could not resolve team_id` | Revenium could not work out your team from the write key | Set `REVENIUM_TEAM_ID` in `.env` to your Revenium team ID |
+| `seed_insights.py --verify` says `The Insights API rejected key ... (HTTP 403)` | Insights runs need a `rev_sk_` write key. The key in use is the metering key, or it comes from another tenant | Put the `rev_sk_` write key from the same tenant in `REVENIUM_WRITE_API_KEY`. Leave `REVENIUM_INSIGHTS_API_KEY` empty unless it holds a `rev_sk_` key. Or start the run from the Insights page in the Revenium app, over the last 30 days with no filters |
 | Calls show **$0 cost** in Revenium | Revenium's price list does not include that model yet | Switch that agent to an older fallback model (see the `404` row above), or ask your Revenium contact to add pricing for the model |
 | **Revenium dashboard is empty** | Data lags about 1 minute; a time filter is hiding the run; or the key belongs to a different tenant | Wait 1–2 minutes, set the time range to "last hour", search for your Run ID, and confirm the last line said `Metering OK` |
 
@@ -319,6 +365,6 @@ python run_fleet.py --check       # setup check: one short call per model
 python run_fleet.py --insights-load --rounds 2   # optional: Insights load profile, 29 calls per round (max 10 rounds)
 python seed_insights.py            # optional: Insights seeder dry run, sends nothing
 python seed_insights.py --fire     # sends 6,416 synthetic records (~$1,800 synthetic spend; sandbox tenant only)
-python seed_insights.py --verify   # starts an Insights run and reports findings per scenario
+python seed_insights.py --verify --tag <tag>   # starts an Insights run with the rev_sk_ write key; reports findings per scenario
 python run_fleet.py --help        # all options
 ```
