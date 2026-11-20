@@ -827,6 +827,15 @@ def _metering_base():
     return base, None
 
 
+def insights_key() -> tuple:
+    """(value, env var name). Insights runs need a rev_sk_ write key; the metering key is never used."""
+    for name in ("REVENIUM_INSIGHTS_API_KEY", "REVENIUM_WRITE_API_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value, name
+    return "", ""
+
+
 def _money(value: float) -> str:
     return f"~${value:,.2f}"
 
@@ -836,7 +845,7 @@ def print_plan(ctx, mode, key, meter_url, selected) -> tuple:
     rows = [
         ("Seed tag", ctx.tag),
         ("Mode", mode),
-        ("Revenium key", mask(key) if key else "not set"),
+        ("Metering key", mask(key) if key else "not set"),
         ("Metering URL", meter_url),
         ("Environment", ctx.environment),
         ("Trace type", TRACE_TYPE),
@@ -939,6 +948,28 @@ def _run(args, keys) -> int:
         say("Dry run: nothing was sent. Add --fire to send these records.")
         return 0
 
+    # Check every --verify setting before --fire sends: synthetic spend cannot be removed.
+    verify_key, app_url = "", ""
+    if args.verify:
+        verify_key, key_name = insights_key()
+        if not verify_key:
+            say("--verify needs a Revenium write key. Set REVENIUM_WRITE_API_KEY in .env to your "
+                "rev_sk_ write key (REVENIUM_INSIGHTS_API_KEY overrides it). The metering key cannot "
+                "start Insights runs. Nothing was sent.", style="red")
+            return 1
+        say(f"{'Insights key':<16} {mask(verify_key)} ({key_name})")
+        app_url = os.environ.get("REVENIUM_INSIGHTS_APP_URL", "").strip().rstrip("/")
+        if not app_url:
+            if base != DEFAULT_BASE_URL:
+                say(f"The metering address is {base}, so the Revenium app address is unknown. Set "
+                    "REVENIUM_INSIGHTS_APP_URL in .env.", style="red")
+                return 1
+            app_url = DEFAULT_APP_URL
+        parts = urlsplit(app_url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            say(f"REVENIUM_INSIGHTS_APP_URL {app_url!r} is not an http(s) URL.", style="red")
+            return 1
+
     if args.fire:
         if not key.startswith(("hak_", "rev_")):
             say("REVENIUM_METERING_API_KEY must be set in .env to a metering key starting hak_ or "
@@ -981,22 +1012,6 @@ def _run(args, keys) -> int:
         say(f"Waiting {INGEST_WAIT_SECONDS} s for Revenium to ingest the records before the Insights run.")
         time.sleep(INGEST_WAIT_SECONDS)
 
-    verify_key = (os.environ.get("REVENIUM_INSIGHTS_API_KEY", "").strip() or key)
-    if not verify_key:
-        say("Set REVENIUM_INSIGHTS_API_KEY or REVENIUM_METERING_API_KEY in .env to run --verify.",
-            style="red")
-        return 1
-    app_url = os.environ.get("REVENIUM_INSIGHTS_APP_URL", "").strip().rstrip("/")
-    if not app_url:
-        if base != DEFAULT_BASE_URL:
-            say(f"The metering address is {base}, so the Revenium app address is unknown. Set "
-                "REVENIUM_INSIGHTS_APP_URL in .env.", style="red")
-            return 1
-        app_url = DEFAULT_APP_URL
-    parts = urlsplit(app_url)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        say(f"REVENIUM_INSIGHTS_APP_URL {app_url!r} is not an http(s) URL.", style="red")
-        return 1
     known_tag = tag if (args.tag or args.fire) else None
     return verify(app_url, verify_key, args.period_days, keys, known_tag)
 

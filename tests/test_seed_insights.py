@@ -19,6 +19,8 @@ import seed_insights as si
 from run_fleet import mask
 
 FAKE_KEY = "hak_offline_test_key_1234"
+WRITE_KEY = "rev_sk_offline_write_key_5678"
+INSIGHTS_KEY = "rev_sk_offline_insights_key_9012"
 NOW = datetime(2026, 11, 20, 12, 30, 0, tzinfo=timezone.utc)
 TAG = "seed-test"
 
@@ -48,6 +50,7 @@ class Base(unittest.TestCase):
             "REVENIUM_METERING_BASE_URL": "",
             "REVENIUM_INSIGHTS_APP_URL": "",
             "REVENIUM_INSIGHTS_API_KEY": "",
+            "REVENIUM_WRITE_API_KEY": "",
         }
         base_env.update(self.env)
         self.out = io.StringIO()
@@ -215,13 +218,13 @@ class FireTests(Base):
 
 
 class VerifyTests(Base):
-    env = {"REVENIUM_METERING_API_KEY": FAKE_KEY}
+    env = {"REVENIUM_METERING_API_KEY": FAKE_KEY, "REVENIUM_WRITE_API_KEY": WRITE_KEY}
 
     def test_verify_reports_found_and_not_found(self):
         def responder(method, url, headers, body):
             if method == "POST":
                 self.assertTrue(url.endswith("/api/v2/insights/runs"))
-                self.assertEqual(headers["authorization"], f"Bearer {FAKE_KEY}")
+                self.assertEqual(headers["authorization"], f"Bearer {WRITE_KEY}")
                 self.assertIn("periodStart", body)
                 self.assertIn("periodEnd", body)
                 return 201, '{"id":"run-1"}'
@@ -237,6 +240,7 @@ class VerifyTests(Base):
         self.assertIn(si.SCENARIOS["max-tokens-cutoff"].note, self.text)
         self.assertTrue(self.calls[0][1].startswith(si.DEFAULT_APP_URL))
         self.assertNotIn(FAKE_KEY, self.text)
+        self.assertNotIn(WRITE_KEY, self.text)
 
     def test_verify_follows_active_run_on_409(self):
         def responder(method, url, headers, body):
@@ -270,6 +274,64 @@ class VerifyTests(Base):
 class VerifyWithoutKeyTests(Base):
     def test_verify_without_any_key(self):
         self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assertEqual(self.calls, [])
+
+
+def verify_ok(method, url, headers, body):
+    """Fake Insights API: the POST starts run-1, the GET reports it completed."""
+    if method == "POST":
+        return 201, '{"id":"run-1"}'
+    return 200, json.dumps({"status": "completed", "findings": []})
+
+
+class VerifyKeyChoiceTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.responder = verify_ok
+
+    def auth_headers(self):
+        return [headers.get("authorization") for _m, _u, headers, _b in self.calls]
+
+    def test_insights_key_wins(self):
+        with mock.patch.dict(os.environ, {"REVENIUM_METERING_API_KEY": FAKE_KEY,
+                                          "REVENIUM_WRITE_API_KEY": WRITE_KEY,
+                                          "REVENIUM_INSIGHTS_API_KEY": INSIGHTS_KEY}):
+            self.assertEqual(si.insights_key(), (INSIGHTS_KEY, "REVENIUM_INSIGHTS_API_KEY"))
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 0)
+        self.assertTrue(self.calls)
+        self.assertEqual(set(self.auth_headers()), {f"Bearer {INSIGHTS_KEY}"})
+        self.assertIn(mask(INSIGHTS_KEY), self.text)
+        self.assertNotIn(INSIGHTS_KEY, self.text)
+
+    def test_write_key_is_the_default(self):
+        with mock.patch.dict(os.environ, {"REVENIUM_METERING_API_KEY": FAKE_KEY,
+                                          "REVENIUM_WRITE_API_KEY": WRITE_KEY}):
+            self.assertEqual(si.insights_key(), (WRITE_KEY, "REVENIUM_WRITE_API_KEY"))
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 0)
+        self.assertTrue(self.calls)
+        self.assertEqual(set(self.auth_headers()), {f"Bearer {WRITE_KEY}"})
+        for _m, _u, headers, _b in self.calls:
+            self.assertFalse(any(FAKE_KEY in str(v) for v in headers.values()))
+
+    def test_metering_key_is_never_used_for_verify(self):
+        with mock.patch.dict(os.environ, {"REVENIUM_METERING_API_KEY": FAKE_KEY}):
+            self.assertEqual(si.insights_key(), ("", ""))
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assertEqual(self.calls, [])
+        self.assertIn("REVENIUM_WRITE_API_KEY", self.text)
+        self.assertNotIn(FAKE_KEY, self.text)
+
+    def test_missing_key_names_the_write_key(self):
+        self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assertEqual(self.calls, [])
+        self.assertIn("REVENIUM_WRITE_API_KEY", self.text)
+        self.assertIn("rev_sk_", self.text)
+        self.assertIn("Nothing was sent", self.text)
+
+    def test_fire_verify_without_write_key_sends_nothing(self):
+        with mock.patch.dict(os.environ, {"REVENIUM_METERING_API_KEY": FAKE_KEY}):
+            rc = si.main(["--fire", "--yes", "--verify", "--detectors", "retry-waste", "--tps", "50"])
+        self.assertEqual(rc, 1)
         self.assertEqual(self.calls, [])
 
 
