@@ -222,7 +222,130 @@ class Scenario:
 
 
 SONNET = ("claude-sonnet-4-6", "anthropic")
+SONNET_35 = ("claude-3-5-sonnet-latest", "anthropic")
+GPT4O = ("gpt-4o", "openai")
 TERRA = ("gpt-5.6-terra", "openai")
+
+
+def _daily(ctx, start_days_ago, days, per_day) -> list:
+    """Evenly spread calls_per_day timestamps over `days` days from start_days_ago, kept in the window."""
+    lo = ctx.now - timedelta(days=start_days_ago)
+    hi = min(lo + timedelta(days=days), ctx.now) - _SAFETY
+    out = []
+    for d in range(days):
+        day_start = lo + timedelta(days=d)
+        for i in range(per_day):
+            ts = day_start + timedelta(seconds=i / per_day * 86_400 + random.uniform(0, 1_200))
+            out.append(_clamp(ctx, ts, lo=lo, hi=hi))
+    return out
+
+
+def _jitter(value, pct=0.08) -> int:
+    return int(round(value * random.uniform(1 - pct, 1 + pct)))
+
+
+def build_fan_out(ctx) -> list:
+    """agent-graph-amplification: deep chains, wide fan-out and a circular hand-off.
+
+    One 12-deep parent chain, 12 fan-out traces (3 with 15 children, 9 with 3, so the P95 child
+    count is far above the median) and a 6-step loop between two agents. Revenium computes
+    fan-out hourly from the hour that just completed, so these rows are stamped inside the
+    current UTC hour and this scenario is sent first.
+    """
+    key = "fan-out"
+    model, provider = TERRA
+    common = dict(model=model, provider=provider, task_type="agent_orchestration",
+                  inp=120_000, out=24_000, org="fan out")
+    records = []
+
+    # Depth: one trace, each call the child of the previous one, 2-5 h ago.
+    trace = f"trace_{_hex(16)}"
+    start = ctx.now - timedelta(hours=5) + timedelta(seconds=random.uniform(0, 3_600))
+    parent = None
+    for i in range(12):
+        span = f"span_{_hex(16)}"
+        records.append(build_record(ctx, key, ts=start + timedelta(minutes=10 * i), agent=f"depth-{i:02d}",
+                                    trace_id=trace, span_id=span, parent_span_id=parent, **common))
+        parent = span
+
+    # Fan-out and circular: inside the current UTC hour, 7-120 s ago.
+    latest = _latest(ctx)
+    earliest = max(ctx.now - timedelta(seconds=120), ctx.now.replace(minute=0, second=0, microsecond=0))
+    if earliest >= latest:
+        earliest = ctx.now - timedelta(seconds=120)
+
+    def recent(lo=None):
+        lo = lo or earliest
+        return lo + (latest - lo) * random.random()
+
+    for t in range(12):
+        trace = f"trace_{_hex(16)}"
+        span = f"span_{_hex(16)}"
+        ts = earliest + (latest - earliest) * random.random() * 0.5
+        records.append(build_record(ctx, key, ts=ts, agent=f"fan-src-{t:02d}", trace_id=trace,
+                                    span_id=span, **common))
+        for k in range(15 if t < 3 else 3):
+            records.append(build_record(ctx, key, ts=recent(ts), agent=f"fan-tgt-{t:02d}-{k:02d}",
+                                        trace_id=trace, parent_span_id=span, **common))
+
+    trace = f"trace_{_hex(16)}"
+    parent = None
+    ts = earliest
+    for i in range(6):
+        span = f"span_{_hex(16)}"
+        ts = recent(ts)
+        records.append(build_record(ctx, key, ts=ts, agent="cycle-a" if i % 2 == 0 else "cycle-b",
+                                    trace_id=trace, span_id=span, parent_span_id=parent, **common))
+        parent = span
+    return records
+
+
+def build_error_concentration(ctx) -> list:
+    """error-concentration-v1: 600 errors with one error reason, 75% of them on one agent.
+
+    The run tag makes the error reason unique, so existing errors in the tenant cannot dilute it.
+    """
+    key = "error-concentration"
+    model, provider = SONNET
+    others = ("search-agent", "summary-agent", "triage-agent")
+    records = []
+    for i in range(600):
+        agent = "billing-agent" if i < 450 else others[(i - 450) % 3]
+        records.append(build_record(
+            ctx, key, ts=_last_days(ctx, PER_CALL_DAYS), model=model, provider=provider, agent=agent,
+            task_type="support_reply", inp=3_000, out=1_000, org="error concentration",
+            stop_reason="ERROR", error_reason="rate_limit_exceeded",
+        ))
+    return records
+
+
+def build_outdated_model(ctx) -> list:
+    """outdated-model-versions-v1: >=200 calls on a model with a newer successor (about 120M input tokens)."""
+    key = "outdated-model"
+    model, provider = GPT4O
+    return [
+        build_record(ctx, key, ts=_last_days(ctx, PER_CALL_DAYS), model=model, provider=provider,
+                     agent="content-agent", task_type="summarization", inp=120_000, out=1_000,
+                     org="outdated model")
+        for _ in range(1_000)
+    ]
+
+
+def build_prompt_cache_miss(ctx) -> list:
+    """prompt-cache-miss-v1: large repeated prompts with no cache reads or writes.
+
+    600 current calls at 125K input tokens (75M in total) against 150 smaller calls the week
+    before, all with cache read and creation counts of 0.
+    """
+    key = "prompt-cache-miss"
+    model, provider = SONNET
+    common = dict(model=model, provider=provider, agent="kb-agent", task_type="doc_qa", out=400,
+                  org="prompt cache miss", cache_read=0, cache_create=0)
+    records = [build_record(ctx, key, ts=_last_days(ctx, PER_CALL_DAYS), inp=125_000, **common)
+               for _ in range(600)]
+    records += [build_record(ctx, key, ts=_between(ctx, 2 * PER_CALL_DAYS, PER_CALL_DAYS), inp=10_000, **common)
+                for _ in range(150)]
+    return records
 
 
 def build_retry_waste(ctx) -> list:
@@ -252,6 +375,66 @@ def build_retry_waste(ctx) -> list:
     return records
 
 
+def build_model_task_fit(ctx) -> list:
+    """model-task-fit: the same agent and task on two models with very different failure rates.
+
+    160 calls each. claude-sonnet-4-6 fails 2.5% of the time; gpt-4o fails or retries 30%.
+    """
+    key = "model-task-fit"
+    records = []
+    for model, provider in (SONNET, GPT4O):
+        for i in range(160):
+            kwargs = {}
+            if model == SONNET[0] and i < 4:
+                kwargs = dict(stop_reason="ERROR", error_reason="model_error")
+            elif model == GPT4O[0] and i < 48:
+                kwargs = (dict(retry_number=1) if i % 2 == 0
+                          else dict(stop_reason="ERROR", error_reason="model_error"))
+            records.append(build_record(
+                ctx, key, ts=_last_days(ctx, PER_CALL_DAYS), model=model, provider=provider,
+                agent="review-agent", task_type="code_review", inp=1_500, out=500,
+                org="model task fit", **kwargs,
+            ))
+    return records
+
+
+def build_model_awareness(ctx) -> list:
+    """model-awareness-v1: >=120 calls on an older model alias.
+
+    Tokens are small on purpose: this investigator is gated on call count, not on savings.
+    """
+    key = "model-awareness"
+    model, provider = SONNET_35
+    return [
+        build_record(ctx, key, ts=_last_days(ctx, PER_CALL_DAYS), model=model, provider=provider,
+                     agent="tagger-agent", task_type="classify", inp=200, out=100, org="model awareness")
+        for _ in range(140)
+    ]
+
+
+def build_customer_concentration(ctx) -> list:
+    """subscriber-concentration: one customer is about 98% of the spend across 12 organizations."""
+    key = "customer-concentration"
+    model, provider = TERRA
+    common = dict(model=model, provider=provider, agent="org-agent", task_type="account_support")
+    records = [build_record(ctx, key, ts=_last_days(ctx, CURRENT_DAYS), inp=200_000, out=20_000,
+                            org="dominant customer", **common) for _ in range(220)]
+    for n in range(1, 12):
+        records += [build_record(ctx, key, ts=_last_days(ctx, CURRENT_DAYS), inp=5_000, out=1_000,
+                                 org=f"customer {n:02d}", **common) for _ in range(10)]
+    return records
+
+
+def build_credential_spike(ctx) -> list:
+    """Credential usage spike: one credential goes from 7 calls a day to 32 (more than 3x)."""
+    key = "credential-spike"
+    model, provider = TERRA
+    common = dict(model=model, provider=provider, agent="cred-agent", task_type="api_automation",
+                  inp=80_000, out=8_000, org="credential spike", credential="seed-credential")
+    times = _daily(ctx, DORMANT_PRIOR_DAYS, CURRENT_DAYS, 7) + _daily(ctx, CURRENT_DAYS, CURRENT_DAYS, 32)
+    return [build_record(ctx, key, ts=ts, **common) for ts in times]
+
+
 def build_max_tokens_cutoff(ctx) -> list:
     """max-tokens-cutoff-v1: a cluster of truncated answers (80 TOKEN_LIMIT of 120 rows, about $96)."""
     key = "max-tokens-cutoff"
@@ -266,20 +449,115 @@ def build_max_tokens_cutoff(ctx) -> list:
     return records
 
 
+def build_dormant_spend(ctx) -> list:
+    """dormant-spend-v1: spend with no business outcome, and a customer that went quiet.
+
+    A dormant agent: 120 calls in the last 30 days (about $38) on a workflow that never reports
+    an outcome. A dormant customer: 140 calls 30-90 days ago and nothing since.
+    """
+    key = "dormant-spend"
+    model, provider = TERRA
+    common = dict(model=model, provider=provider, inp=80_000, out=8_000)
+    records = [build_record(ctx, key, ts=_last_days(ctx, CURRENT_DAYS), agent="dormant-agent",
+                            task_type="unused_workflow", org="dormant agent", **common)
+               for _ in range(120)]
+    records += [build_record(ctx, key, ts=_between(ctx, CURRENT_DAYS + DORMANT_PRIOR_DAYS, CURRENT_DAYS),
+                             agent="prior-customer-agent", task_type="previously_active_workflow",
+                             org="dormant customer", credential="dormant-credential", **common)
+                for _ in range(140)]
+    return records
+
+
+def _job_extra(ctx, key, kind) -> dict:
+    return {
+        "agenticJobId": f"{key}-{_hex(10)}",
+        "agenticJobType": f"insights_seed_{key.replace('-', '_')}",
+        "agenticJobName": f"Insights Seed {kind} job",
+        "squadId": f"{key}-squad-{ctx.tag}",
+    }
+
+
+def _time_series(ctx, key, kind, agent, task, base_per_day, cur_per_day, base_tokens, cur_tokens):
+    model, provider = TERRA
+    windows = (
+        (_daily(ctx, CURRENT_DAYS + BASELINE_DAYS, BASELINE_DAYS, base_per_day), base_tokens),
+        (_daily(ctx, CURRENT_DAYS, CURRENT_DAYS, cur_per_day), cur_tokens),
+    )
+    records = []
+    for times, (inp, out) in windows:
+        for ts in times:
+            records.append(build_record(
+                ctx, key, ts=ts, model=model, provider=provider, agent=agent, task_type=task,
+                inp=_jitter(inp), out=_jitter(out), org=key.replace("-", " "),
+                extra=_job_extra(ctx, key, kind),
+            ))
+    return records
+
+
+def build_spend_trajectory(ctx) -> list:
+    """spend-trajectory-v1: activity grows from 8 to 22 jobs a day at a steady cost per job.
+
+    28-day baseline then 30 current days; spend nearly triples while unit cost stays flat
+    (only +/-8% jitter), so the growth comes from activity.
+    """
+    return _time_series(ctx, "spend-trajectory", "spend trajectory", "spend-agent", "spend_trajectory",
+                        8, 22, (50_000, 5_000), (50_000, 5_000))
+
+
+def build_unit_economics_drift(ctx) -> list:
+    """unit-economics-drift-v1: cost per job rises about 17x between the baseline and current windows."""
+    return _time_series(ctx, "unit-economics-drift", "unit economics drift", "unit-econ-agent",
+                        "unit_economics", 10, 14, (5_000, 1_000), (120_000, 12_000))
+
+
 SCENARIOS = {
     s.key: s
     for s in (
+        Scenario(
+            "fan-out", "agent-graph-amplification", ("fan_out_circular", "agent_graph_amplification"),
+            build_fan_out,
+            note="Computed hourly from the hour that just completed. If it is missing, verify again "
+            "after the next full UTC hour.",
+        ),
+        Scenario("error-concentration", "error-concentration-v1", ("error_concentration",),
+                 build_error_concentration, per_call=True),
+        Scenario(
+            "outdated-model", "outdated-model-versions-v1", ("outdated_model", "outdated_model_versions"),
+            build_outdated_model,
+            note="Keeps the gpt-4o model id: the investigator needs a model with a newer successor.",
+            per_call=True,
+        ),
+        Scenario("prompt-cache-miss", "prompt-cache-miss-v1", ("prompt_cache_miss",),
+                 build_prompt_cache_miss, per_call=True),
         Scenario(
             "retry-waste", "retry-waste", ("retry_waste",), build_retry_waste,
             note="If it is missing from a 30-day run, verify with --period-days 7.",
             per_call=True,
         ),
+        Scenario("model-task-fit", "model-task-fit", ("model_task_fit",), build_model_task_fit,
+                 per_call=True),
+        Scenario(
+            "model-awareness", "model-awareness-v1", ("model_awareness",), build_model_awareness,
+            note="Keeps the claude-3-5-sonnet-latest model id: the investigator needs a model with a "
+            "newer successor.",
+            per_call=True,
+        ),
+        Scenario(
+            "customer-concentration", "subscriber-concentration", ("org_pareto", "subscriber_concentration"),
+            build_customer_concentration,
+            note="Do not filter the Insights run by organization.",
+        ),
+        Scenario("credential-spike", "credential_spike", ("credential_spike",), build_credential_spike),
         Scenario(
             "max-tokens-cutoff", "max-tokens-cutoff-v1", ("truncation_cluster", "max_tokens_cutoff"),
             build_max_tokens_cutoff,
             note="May not fire: the metering API takes the TOKEN_LIMIT stop reason, and this "
             "investigator may only recognise provider-native stop reasons.",
         ),
+        Scenario("dormant-spend", "dormant-spend-v1", ("dormant_spend",), build_dormant_spend),
+        Scenario("spend-trajectory", "spend-trajectory-v1", ("spend_trajectory",), build_spend_trajectory),
+        Scenario("unit-economics-drift", "unit-economics-drift-v1", ("unit_economics_drift",),
+                 build_unit_economics_drift),
     )
 }
 
@@ -643,8 +921,9 @@ def _run(args, keys) -> int:
     ctx = SeedContext(tag=tag, environment=args.environment, now=datetime.now(timezone.utc))
     selected = build(ctx, keys)
     records, spend = print_plan(ctx, mode, key, meter_url, selected)
-    minutes = records / args.tps / 60
-    say(f"{'TOTAL':<24} {records:>5} records  {_money(spend)}  about {minutes:.0f} min to send "
+    seconds = records / args.tps
+    duration = f"{seconds / 60:.0f} min" if seconds >= 90 else f"{seconds:.0f} s"
+    say(f"{'TOTAL':<24} {records:>5} records  {_money(spend)}  about {duration} to send "
         f"at {args.tps:g} records/s")
     say("Estimates use list prices; Revenium computes the real cost.")
 

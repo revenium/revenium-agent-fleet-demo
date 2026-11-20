@@ -273,5 +273,219 @@ class VerifyWithoutKeyTests(Base):
         self.assertEqual(self.calls, [])
 
 
+ALL_KEYS = (
+    "fan-out error-concentration outdated-model prompt-cache-miss retry-waste model-task-fit "
+    "model-awareness customer-concentration credential-spike max-tokens-cutoff dormant-spend "
+    "spend-trajectory unit-economics-drift"
+).split()
+EXPECTED_COUNTS = {
+    "fan-out": 102, "error-concentration": 600, "outdated-model": 1000, "prompt-cache-miss": 750,
+    "retry-waste": 40, "model-task-fit": 320, "model-awareness": 140, "customer-concentration": 330,
+    "credential-spike": 1170, "max-tokens-cutoff": 120, "dormant-spend": 260,
+    "spend-trajectory": 884, "unit-economics-drift": 700,
+}
+
+
+class AllScenarioTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.built = si.build(ctx(), list(si.SCENARIOS))
+        cls.all = [r for recs in cls.built.values() for r in recs]
+
+    def recs(self, key):
+        return self.built[key]
+
+    def age(self, rec):
+        return NOW - parse(rec["requestTime"])
+
+    # whole build
+
+    def test_registry_order_and_counts(self):
+        self.assertEqual(list(si.SCENARIOS), ALL_KEYS)
+        self.assertEqual(list(self.built), ALL_KEYS)
+        self.assertEqual({k: len(v) for k, v in self.built.items()}, EXPECTED_COUNTS)
+        self.assertEqual(len(self.all), 6416)
+
+    def test_wire_fields_everywhere(self):
+        for r in self.all:
+            self.assertEqual(r["costType"], "AI")
+            self.assertEqual(r["totalTokenCount"], r["inputTokenCount"] + r["outputTokenCount"])
+            self.assertIn(r["stopReason"], ("END", "ERROR", "TOKEN_LIMIT"))
+            self.assertIn(r["operationType"], ("CHAT", "TOOL_CALL"))
+            self.assertIn(r["region"], si.REGIONS)
+            self.assertEqual(r["environment"], "insights-seed")
+            self.assertEqual(r["traceType"], "insights-seed")
+            self.assertEqual(r["productName"], "Insights Seed")
+            self.assertTrue(r["organizationName"].startswith("Insights Seed –"))
+            self.assertIn(TAG, r["organizationName"])
+            self.assertTrue(r["traceName"].startswith("Insights Seed –"))
+            self.assertTrue(r["agent"].endswith(TAG))
+            self.assertIn(r["model"], si.PRICES)
+            self.assertEqual("errorReason" in r, r["stopReason"] == "ERROR")
+            if "errorReason" in r:
+                self.assertTrue(r["errorReason"].endswith(TAG))
+
+    def test_timestamps(self):
+        floor = NOW - timedelta(days=91)
+        for r in self.all:
+            req, first, resp = (parse(r[k]) for k in ("requestTime", "completionStartTime", "responseTime"))
+            self.assertTrue(floor <= req <= first <= resp <= NOW, r["transactionName"])
+
+    def test_per_call_windows(self):
+        week = timedelta(days=7)
+        for key, scenario in si.SCENARIOS.items():
+            if not scenario.per_call:
+                continue
+            for r in self.recs(key):
+                if key == "prompt-cache-miss" and r["inputTokenCount"] == 10_000:
+                    self.assertTrue(week < self.age(r) <= timedelta(days=14))
+                else:
+                    self.assertLessEqual(self.age(r), week, key)
+        per_call = {k for k, s in si.SCENARIOS.items() if s.per_call}
+        self.assertEqual(per_call, {"error-concentration", "outdated-model", "prompt-cache-miss",
+                                    "retry-waste", "model-task-fit", "model-awareness"})
+
+    def test_fan_out_is_sent_first(self):
+        self.assertEqual(next(iter(si.SCENARIOS)), "fan-out")
+
+    # per scenario
+
+    def test_fan_out(self):
+        recs = self.recs("fan-out")
+        by_trace = {}
+        for r in recs:
+            by_trace.setdefault(r["traceId"], []).append(r)
+        depth = [r for r in recs if "-depth-" in r["agent"] or r["agent"].startswith("depth-")]
+        self.assertEqual(len(depth), 12)
+        self.assertEqual(len({r["traceId"] for r in depth}), 1)
+        for prev, cur in zip(depth, depth[1:]):
+            self.assertEqual(cur["parentSpanId"], prev["spanId"])
+        for r in depth:
+            self.assertTrue(timedelta(hours=2) <= self.age(r) <= timedelta(hours=5))
+        parents = [r for r in recs if r["agent"].startswith("fan-src-")]
+        self.assertEqual(len(parents), 12)
+        sizes = []
+        for parent in parents:
+            children = [r for r in by_trace[parent["traceId"]] if r["agent"].startswith("fan-tgt-")]
+            self.assertTrue(all(c["parentSpanId"] == parent["spanId"] for c in children))
+            sizes.append(len(children))
+        self.assertEqual(sorted(sizes), [3] * 9 + [15] * 3)
+        cycle = [r for r in recs if r["agent"].startswith("cycle-")]
+        self.assertEqual(len(cycle), 6)
+        self.assertEqual(len({r["agent"] for r in cycle}), 2)
+        for prev, cur in zip(cycle, cycle[1:]):
+            self.assertEqual(cur["parentSpanId"], prev["spanId"])
+            self.assertNotEqual(cur["agent"], prev["agent"])
+        for r in parents + cycle + [r for r in recs if r["agent"].startswith("fan-tgt-")]:
+            self.assertLessEqual(self.age(r), timedelta(seconds=120))
+
+    def test_error_concentration(self):
+        recs = self.recs("error-concentration")
+        self.assertEqual(len(recs), 600)
+        self.assertTrue(all(r["stopReason"] == "ERROR" for r in recs))
+        reasons = {r["errorReason"] for r in recs}
+        self.assertEqual(len(reasons), 1)
+        self.assertIn(TAG, reasons.pop())
+        agents = {}
+        for r in recs:
+            agents[r["agent"]] = agents.get(r["agent"], 0) + 1
+        self.assertGreaterEqual(max(agents.values()) / len(recs), 0.75)
+
+    def test_outdated_model(self):
+        recs = [r for r in self.recs("outdated-model") if r["model"] == "gpt-4o"]
+        self.assertGreaterEqual(len(recs), 200)
+        self.assertGreaterEqual(sum(r["inputTokenCount"] for r in recs), 120_000_000)
+
+    def test_prompt_cache_miss(self):
+        recs = self.recs("prompt-cache-miss")
+        current = [r for r in recs if self.age(r) <= timedelta(days=7)]
+        prior = [r for r in recs if self.age(r) > timedelta(days=7)]
+        self.assertGreaterEqual(len(current), 120)
+        self.assertGreaterEqual(len(prior), 120)
+        self.assertTrue(all(r["cacheReadTokenCount"] == 0 and r["cacheCreationTokenCount"] == 0 for r in recs))
+        self.assertGreaterEqual(sum(r["inputTokenCount"] for r in current), 74_000_000)
+
+    def test_model_task_fit(self):
+        recs = self.recs("model-task-fit")
+        self.assertEqual(len({(r["agent"], r["taskType"]) for r in recs}), 1)
+        rates = {}
+        for model in ("claude-sonnet-4-6", "gpt-4o"):
+            rows = [r for r in recs if r["model"] == model]
+            self.assertGreaterEqual(len(rows), 150)
+            bad = [r for r in rows if r["stopReason"] == "ERROR" or r.get("retryNumber", 0) > 0]
+            rates[model] = len(bad) / len(rows)
+        self.assertLessEqual(rates["claude-sonnet-4-6"], 0.05)
+        self.assertGreaterEqual(rates["gpt-4o"], 0.25)
+
+    def test_model_awareness(self):
+        recs = [r for r in self.recs("model-awareness") if r["model"] == "claude-3-5-sonnet-latest"]
+        self.assertGreaterEqual(len(recs), 120)
+
+    def test_customer_concentration(self):
+        recs = self.recs("customer-concentration")
+        spend = {}
+        for r in recs:
+            spend[r["organizationName"]] = spend.get(r["organizationName"], 0) + si.estimate_cost(r)
+        self.assertEqual(len(spend), 12)
+        self.assertGreaterEqual(max(spend.values()) / sum(spend.values()), 0.70)
+
+    def test_credential_spike(self):
+        recs = self.recs("credential-spike")
+        self.assertEqual(len({r["subscriber"]["credential"]["name"] for r in recs}), 1)
+        self.assertEqual(len({r["subscriber"]["id"] for r in recs}), 1)
+        baseline = [r for r in recs if self.age(r) > timedelta(days=30)]
+        spike = [r for r in recs if self.age(r) <= timedelta(days=30)]
+        self.assertGreater(len(spike) / 30, 3 * len(baseline) / 30)
+        self.assertEqual(len(baseline), 210)
+
+    def test_max_tokens_cutoff(self):
+        recs = self.recs("max-tokens-cutoff")
+        cut = [r for r in recs if r["stopReason"] == "TOKEN_LIMIT"]
+        self.assertGreaterEqual(len(cut), 50)
+        self.assertGreater(len(cut) / len(recs), 0.05)
+
+    def test_dormant_spend(self):
+        recs = self.recs("dormant-spend")
+        agent = [r for r in recs if "dormant agent" in r["organizationName"]]
+        customer = [r for r in recs if "dormant customer" in r["organizationName"]]
+        self.assertEqual((len(agent), len(customer)), (120, 140))
+        self.assertGreaterEqual(cost(agent), 25)
+        self.assertTrue(all(self.age(r) > timedelta(days=30) for r in customer))
+        self.assertTrue(all(self.age(r) <= timedelta(days=30) for r in agent))
+
+    def _windows(self, key):
+        recs = self.recs(key)
+        baseline = [r for r in recs if self.age(r) > timedelta(days=30)]
+        current = [r for r in recs if self.age(r) <= timedelta(days=30)]
+        for r in recs:
+            self.assertTrue(r["agenticJobId"].startswith(key + "-"))
+            self.assertIn("agenticJobType", r)
+        self.assertEqual(len({r["agenticJobId"] for r in recs}), len(recs))
+        return baseline, current
+
+    def test_spend_trajectory(self):
+        baseline, current = self._windows("spend-trajectory")
+        self.assertEqual((len(baseline), len(current)), (224, 660))
+        self.assertGreaterEqual(cost(current), 2 * cost(baseline))
+        ratio = (cost(current) / len(current)) / (cost(baseline) / len(baseline))
+        self.assertTrue(0.75 <= ratio <= 1.25)
+
+    def test_unit_economics_drift(self):
+        baseline, current = self._windows("unit-economics-drift")
+        self.assertEqual((len(baseline), len(current)), (280, 420))
+        ratio = (cost(current) / len(current)) / (cost(baseline) / len(baseline))
+        self.assertGreaterEqual(ratio, 5)
+
+
+class FullDryRunTests(Base):
+    def test_full_dry_run_lists_every_scenario(self):
+        self.assertEqual(si.main([]), 0)
+        lines = self.text.splitlines()
+        for key in ALL_KEYS:
+            self.assertEqual(sum(l.startswith(key + " ") for l in lines), 1, key)
+        self.assertTrue(any(l.startswith("TOTAL ") and "6416" in l for l in lines))
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
