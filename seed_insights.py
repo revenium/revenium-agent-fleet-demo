@@ -3,12 +3,13 @@
 Revenium AI Insights investigators only report a finding once a pattern reaches a minimum
 volume and dollar amount. A quiet non-production tenant never gets there, and real LLM calls
 cannot get there affordably. This script posts synthetic, backdated completion records straight
-to the Revenium metering API instead. It makes no LLM calls and needs no provider keys: only the
-Revenium metering key the demo already uses.
+to the Revenium metering API instead. It makes no LLM calls and needs no provider keys. --fire
+uses the Revenium metering key (REVENIUM_METERING_API_KEY). --verify uses the rev_sk_ write key
+(REVENIUM_WRITE_API_KEY).
 
   python seed_insights.py              # DRY RUN (default): builds and summarises, sends nothing
-  python seed_insights.py --fire       # sends the records (asks you to type yes first)
-  python seed_insights.py --verify     # starts an Insights run and reports what it found
+  python seed_insights.py --fire       # sends the records with the metering key (asks for yes first)
+  python seed_insights.py --verify     # starts an Insights run with the rev_sk_ write key
 
 Every record is tagged so it stays identifiable: environment and trace type `insights-seed`,
 product `Insights Seed`, organization and trace names starting `Insights Seed –`, and a run tag
@@ -712,6 +713,13 @@ def _categories(finding) -> list:
     return [finding[k] for k in ("category", "investigatorId", "investigator") if finding.get(k)]
 
 
+def _rejected(api_key, status) -> str:
+    return (f"The Insights API rejected key {mask(api_key)} (HTTP {status}). Insights runs need a "
+            "rev_sk_ write key from the same tenant as the metering key. Set REVENIUM_WRITE_API_KEY "
+            "in .env (REVENIUM_INSIGHTS_API_KEY overrides it). Or start the run from the "
+            "Insights page in the Revenium app instead: last 30 days, no filters.")
+
+
 def verify(app_url, api_key, period_days, keys, tag) -> int:
     """Start an Insights run (or follow the active one), wait for it and report per scenario.
 
@@ -739,8 +747,7 @@ def verify(app_url, api_key, period_days, keys, tag) -> int:
             "Its period may differ from the one requested.", style="yellow")
         run_id = _active_run(app_url, headers)
     elif status in (401, 403):
-        say(f"The Insights API rejected key {mask(api_key)} (HTTP {status}). Set "
-            "REVENIUM_INSIGHTS_API_KEY in .env to a key that can start Insights runs.", style="red")
+        say(_rejected(api_key, status), style="red")
         return 1
     else:
         say(f"Could not start an Insights run: HTTP {status} {text[:MAX_BODY]}", style="red")
@@ -767,7 +774,7 @@ def verify(app_url, api_key, period_days, keys, tag) -> int:
                 say(f"Insights run {run_id} ended with status {state}.", style="red")
                 return 1
         elif status in (401, 403):
-            say(f"The Insights API rejected key {mask(api_key)} while polling (HTTP {status}).", style="red")
+            say(f"While polling: {_rejected(api_key, status)}", style="red")
             return 1
         else:
             say(f"  poll: HTTP {status} {text[:MAX_BODY]}")
@@ -878,7 +885,8 @@ def main(argv=None) -> int:
                         help="send the records (synthetic spend appears in the tenant and cannot be deleted)")
     parser.add_argument("--yes", action="store_true", help="with --fire: skip the interactive confirmation")
     parser.add_argument("--verify", action="store_true",
-                        help="start a Revenium AI Insights run and report which scenarios produced findings")
+                        help="start a Revenium AI Insights run with the rev_sk_ write key "
+                        "(REVENIUM_WRITE_API_KEY) and report which scenarios produced findings")
     parser.add_argument("--detectors", default=None, metavar="KEYS",
                         help=f"comma list of scenarios (default: all): {', '.join(SCENARIOS)}")
     parser.add_argument("--tps", type=float, default=DEFAULT_TPS, metavar="N",
@@ -958,6 +966,10 @@ def _run(args, keys) -> int:
                 "start Insights runs. Nothing was sent.", style="red")
             return 1
         say(f"{'Insights key':<16} {mask(verify_key)} ({key_name})")
+        if not verify_key.startswith("rev_sk_"):
+            say(f"WARNING: Insights key {mask(verify_key)} from {key_name} does not start with "
+                "rev_sk_. Insights runs need a rev_sk_ write key, so this run may be rejected with "
+                "HTTP 403.", style="yellow")
         app_url = os.environ.get("REVENIUM_INSIGHTS_APP_URL", "").strip().rstrip("/")
         if not app_url:
             if base != DEFAULT_BASE_URL:
