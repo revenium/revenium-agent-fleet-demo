@@ -6,8 +6,10 @@ No paid call is ever made: both provider functions in fleet/llm.py are replaced 
 the Revenium keys are blanked so no metering client starts, and .env is never loaded.
 """
 import contextlib
+import importlib
 import io
 import os
+from pathlib import Path
 
 # Set BEFORE anything imports fleet: fleet/config.py and the provider clients read env at import.
 os.environ["ANTHROPIC_API_KEY"] = "offline-test-not-a-key"
@@ -31,14 +33,15 @@ class FakeProvider:
         self.calls = []
 
     def _call(self, provider, model, system, prompt, metadata, max_tokens):
+        response_id = f"fake-{len(self.calls) + 1}"
         self.calls.append({
             "provider": provider, "model": model, "system": system, "prompt": prompt,
-            "metadata": metadata, "max_tokens": max_tokens,
+            "metadata": metadata, "max_tokens": max_tokens, "response_id": response_id,
         })
         if model == getattr(insights_load, "ERROR_MODEL", None):
             raise RuntimeError("Error code: 404 - model not found (offline fake)")
         stop = "max_tokens" if max_tokens < config.MAX_TOKENS else "end_turn"
-        return "ok", f"fake-{len(self.calls)}", 100, 10, stop
+        return "ok", response_id, 100, 10, stop
 
     def anthropic(self, model, system, prompt, metadata, max_tokens):
         return self._call("anthropic", model, system, prompt, metadata, max_tokens)
@@ -118,7 +121,7 @@ class LoadTests(Base):
         responders = [c for c in calls if c["metadata"]["agent"] == "responder"]
         self.assertEqual([c["metadata"]["retry_number"] for c in responders], [0, 1, 2])
         self.assertEqual(len({c["metadata"]["trace_id"] for c in calls}), 1)
-        root_id = f"fake-{self.fake.calls.index(calls[0]) + 1}"
+        root_id = calls[0]["response_id"]
         self.assertEqual(calls[0]["metadata"]["agent"], "classifier")
         self.assertTrue(all(c["metadata"]["parent_transaction_id"] == root_id for c in responders))
         globex = data.CUSTOMERS["globex"].org
@@ -133,6 +136,144 @@ class LoadTests(Base):
                 self.run_rounds(rounds)
         self.assertEqual(self.fake.calls, [])
         self.assertEqual(run_fleet.INSIGHTS_MAX_ROUNDS, insights_load.MAX_ROUNDS)
+
+
+class PatternTests(Base):
+    def test_table_totals_and_order(self):
+        self.assertEqual(insights_load.CALLS_PER_ROUND, 29)
+        self.assertEqual(insights_load.EXPECTED_ERRORS_PER_ROUND, 2)
+        self.assertEqual(
+            [p.key for p in insights_load.PATTERNS],
+            ["baseline", "retry-waste", "error-concentration", "max-tokens-cutoff",
+             "model-task-fit", "outdated-model", "bloated-context", "fan-out"],
+        )
+
+    def test_call_counts_match_estimate(self):
+        self.run_rounds(1)
+        self.assertEqual(len(self.fake.calls), 29)
+        self.fake.calls.clear()
+        self.run_rounds(3)
+        self.assertEqual(len(self.fake.calls), 87)
+        self.assertEqual(insights_load.estimated_calls(3), 87)
+
+    def test_every_call_is_tagged(self):
+        self.run_rounds(1)
+        for c in self.fake.calls:
+            md = c["metadata"]
+            self.assertEqual(md["trace_type"], "insights-load")
+            self.assertEqual(md["agentic_job_type"], "insights_load")
+            self.assertEqual(md["environment"], config.ENVIRONMENT)
+            self.assertNotIn("ticket_id", md)
+
+    def test_error_concentration(self):
+        results = self.run_rounds(2)
+        for round_no in (1, 2):
+            calls = [c for c in self.calls_for("error-concentration")
+                     if f"-r{round_no}-" in c["metadata"]["trace_id"]]
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(c["metadata"]["agent"] == "researcher" for c in calls))
+            self.assertTrue(all(c["model"] == insights_load.ERROR_MODEL for c in calls))
+            self.assertEqual([c["metadata"]["retry_number"] for c in calls], [0, 1])
+            mine = [r for r in results if r.round_no == round_no]
+            self.assertEqual(sum(r.expected_errors for r in mine), 2)
+        self.assertTrue(all(r.error is None for r in results))
+
+    def test_max_tokens_cutoff(self):
+        self.run_rounds(1)
+        calls = self.calls_for("max-tokens-cutoff")
+        self.assertEqual(sorted(c["provider"] for c in calls), ["anthropic", "openai"])
+        self.assertLess(insights_load.CUTOFF_MAX_TOKENS, config.MAX_TOKENS)
+        self.assertTrue(all(c["max_tokens"] == insights_load.CUTOFF_MAX_TOKENS for c in calls))
+
+    def test_model_task_fit(self):
+        self.run_rounds(1)
+        calls = self.calls_for("model-task-fit")
+        self.assertEqual(len(calls), 2)
+        for c in calls:
+            self.assertEqual(c["metadata"]["agent"], "classifier")
+            self.assertEqual(c["metadata"]["task_type"], "ticket-classification")
+            self.assertEqual(c["model"], config.AGENT_MODELS["responder"][1])
+        self.assertNotEqual(calls[0]["prompt"], calls[1]["prompt"])
+
+    def test_outdated_model(self):
+        self.run_rounds(1)
+        first, second = self.calls_for("outdated-model")
+        self.assertEqual((first["provider"], first["model"]),
+                         ("anthropic", insights_load.LEGACY_ANTHROPIC_MODEL))
+        self.assertEqual((second["provider"], second["model"]),
+                         ("openai", insights_load.LEGACY_OPENAI_MODEL))
+        self.assertEqual(second["metadata"]["parent_transaction_id"], first["response_id"])
+
+    def test_bloated_context(self):
+        self.run_rounds(1)
+        calls = self.calls_for("bloated-context")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c["metadata"]["agent"] == "responder" for c in calls))
+        self.assertEqual(len({c["system"] for c in calls}), 1)
+        self.assertGreaterEqual(len(calls[0]["system"]), 24000)
+        self.assertEqual(len({c["prompt"] for c in calls}), 3)
+
+    def test_fan_out(self):
+        self.run_rounds(1)
+        calls = self.calls_for("fan-out")
+        self.assertEqual(len(calls), 8)
+        root = calls[0]
+        self.assertEqual(root["metadata"]["agent"], "classifier")
+        siblings = [c for c in calls if c["metadata"]["agent"] == "researcher"
+                    and c["metadata"]["parent_transaction_id"] == root["response_id"]]
+        self.assertGreaterEqual(len(siblings), 3)
+        loop = calls[-4:]
+        self.assertEqual([c["metadata"]["agent"] for c in loop],
+                         ["qa-reviewer", "researcher", "qa-reviewer", "researcher"])
+        for prev, cur in zip(calls[-5:-1], loop):
+            self.assertEqual(cur["metadata"]["parent_transaction_id"], prev["response_id"])
+
+    def test_subscriber_concentration(self):
+        globex = data.CUSTOMERS["globex"].org
+        for rounds in (1, 3):
+            self.fake.calls.clear()
+            self.run_rounds(rounds)
+            orgs = [c["metadata"]["organizationName"] for c in self.fake.calls]
+            self.assertGreaterEqual(orgs.count(globex) / len(orgs), 0.70)
+            for c in self.fake.calls:
+                md = c["metadata"]
+                if md["organizationName"] != globex:
+                    self.assertIn("-baseline-", md["trace_id"])
+                self.assertNotEqual(md["organizationName"], data.CUSTOMERS["acme"].org)
+
+    def test_env_overrides_legacy_model(self):
+        try:
+            with mock.patch.dict(os.environ, {"INSIGHTS_LEGACY_OPENAI_MODEL": "gpt-test-legacy"}):
+                importlib.reload(insights_load)
+                self.assertEqual(insights_load.LEGACY_OPENAI_MODEL, "gpt-test-legacy")
+            with mock.patch.dict(os.environ, {"INSIGHTS_LEGACY_OPENAI_MODEL": "  "}):
+                importlib.reload(insights_load)
+                self.assertEqual(insights_load.LEGACY_OPENAI_MODEL,
+                                 insights_load.DEFAULT_LEGACY_OPENAI_MODEL)
+        finally:
+            importlib.reload(insights_load)
+
+    def test_env_example_lists_defaults(self):
+        # Parses .env.example only; .env is never opened.
+        path = Path(__file__).resolve().parent.parent / ".env.example"
+        values = {}
+        for line in path.read_text().splitlines():
+            if line.startswith("INSIGHTS_") and "=" in line:
+                name, value = line.split("=", 1)
+                values[name.strip()] = value.strip()
+        self.assertEqual(values, {
+            "INSIGHTS_ERROR_MODEL": insights_load.DEFAULT_ERROR_MODEL,
+            "INSIGHTS_LEGACY_ANTHROPIC_MODEL": insights_load.DEFAULT_LEGACY_ANTHROPIC_MODEL,
+            "INSIGHTS_LEGACY_OPENAI_MODEL": insights_load.DEFAULT_LEGACY_OPENAI_MODEL,
+        })
+
+    def test_preflight_rows_name_models(self):
+        rows = dict(insights_load.preflight_rows(2))
+        self.assertIn(f"openai/{insights_load.ERROR_MODEL}", rows["Error model"])
+        self.assertIn(f"anthropic/{insights_load.LEGACY_ANTHROPIC_MODEL}", rows["Legacy models"])
+        self.assertIn(f"openai/{insights_load.LEGACY_OPENAI_MODEL}", rows["Legacy models"])
+        self.assertIn(f"anthropic/{config.AGENT_MODELS['responder'][1]}", rows["Model-task fit"])
+        self.assertIn("58 LLM calls", rows["Estimated calls"])
 
 
 class CliTests(Base):
@@ -180,6 +321,26 @@ class CliTests(Base):
         self.assertIn(f"{insights_load.estimated_calls(1)} LLM calls", text)
         self.assertIn("Calls per pattern", text)
         self.assertTrue(text.rstrip().splitlines()[-1].startswith("Metering OK"))
+
+    def test_expected_errors_print_yellow_and_unexpected_errors_exit_1(self):
+        ok = lambda e, s: llm.DeliveryStatus(e, 0, 0, None, True)  # noqa: E731
+        out = io.StringIO()
+        with mock.patch.object(llm, "flush_and_status", ok), contextlib.redirect_stdout(out):
+            self.assertEqual(run_fleet.run_insights_load("run-test", 1), 0)
+        self.assertEqual(out.getvalue().count("✗ (expected)"), insights_load.EXPECTED_ERRORS_PER_ROUND)
+
+        legacy = insights_load.LEGACY_OPENAI_MODEL
+        real_openai = self.fake.openai
+
+        def broken_openai(model, *args):
+            if model == legacy:
+                raise RuntimeError("Error code: 404 - unexpected (offline fake)")
+            return real_openai(model, *args)
+
+        with mock.patch.object(llm, "_openai_call", broken_openai), \
+                mock.patch.object(llm, "flush_and_status", ok), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_fleet.run_insights_load("run-test", 1), 1)
 
     def test_help_lists_flags(self):
         code, out, _err = self._main(["--help"])

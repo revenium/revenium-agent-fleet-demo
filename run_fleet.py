@@ -354,19 +354,23 @@ def print_load_summary(results: list, run_id: str) -> None:
     from fleet import insights_load
 
     console.rule("Summary")
+    # Investigator ids are long: on a narrow terminal they go below the table instead of being cut.
+    wide = console.width >= 120
     table = Table(title="Calls per pattern", box=box.SIMPLE)
     table.add_column("Pattern", no_wrap=True)
-    table.add_column("Investigators")
+    if wide:
+        table.add_column("Investigators")
     for name in ("Calls", "Expected errors", "Unexpected errors", "Input tok", "Output tok"):
-        table.add_column(name, justify="right")
+        table.add_column(name, justify="right", min_width=max(len(w) for w in name.split()))
     for pattern in insights_load.PATTERNS:
         mine = [r for r in results if r.pattern_key == pattern.key]
         if not mine:
             continue
         calls = [c for r in mine for c in r.calls]
+        investigators = [Text(", ".join(pattern.investigators) or "-")] if wide else []
         table.add_row(
             Text(pattern.key),
-            Text(", ".join(pattern.investigators) or "-"),
+            *investigators,
             Text(str(sum(r.attempted for r in mine))),
             Text(str(sum(r.expected_errors for r in mine))),
             Text(str(sum(1 for r in mine if r.error))),
@@ -374,6 +378,11 @@ def print_load_summary(results: list, run_id: str) -> None:
             Text(str(sum(c.output_tokens for c in calls))),
         )
     console.print(table)
+    if not wide:
+        for pattern in insights_load.PATTERNS:
+            if any(r.pattern_key == pattern.key for r in results):
+                console.print(f"  {pattern.key:<20} → {', '.join(pattern.investigators) or '-'}",
+                              markup=False, highlight=False)
 
     attempted = sum(r.attempted for r in results)
     calls = [c for r in results for c in r.calls]
