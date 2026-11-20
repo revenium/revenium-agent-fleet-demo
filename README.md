@@ -232,7 +232,7 @@ Data appears in Revenium about **1 minute** after the run. Copy the **Run ID** f
 
 ## Surfacing Revenium AI Insights (optional)
 
-A quiet test tenant gives Revenium AI Insights nothing to find. `python run_fleet.py --insights-load --rounds 2` runs an opt-in load profile of deliberately wasteful, labelled patterns (retries, errors, cut-off replies, oversized and outdated models, a repeated large prompt, redundant agent calls). It is capped at 10 rounds and prints the exact call count before any paid call. [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md) maps each Insights investigator to a pattern and explains scheduling over several days, triggering an Insights run, and porting to AWS Bedrock.
+A quiet test tenant gives Revenium AI Insights nothing to find. `python seed_insights.py` is a dry run that shows the synthetic, backdated metering records it would send to reach each Insights investigator's minimum volumes (no LLM calls). `python seed_insights.py --fire` sends them, and `python seed_insights.py --verify` starts an Insights run and reports which scenarios produced findings. **`--fire` adds about $1,800 of synthetic spend to the tenant's dashboards that cannot be deleted, so use a sandbox tenant.** To see the same patterns on real, paid LLM calls, `python run_fleet.py --insights-load --rounds 2` runs an opt-in load profile (29 calls per round, capped at 10 rounds). [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md) maps each investigator to a seeded scenario, explains how to check the results, and covers AWS Bedrock.
 
 ---
 
@@ -280,6 +280,7 @@ The rest of the code is plain Python that you can read top to bottom:
 | [`fleet/config.py`](fleet/config.py) | Which model each agent uses |
 | [`fleet/data.py`](fleet/data.py) | Fictional customers, tickets, knowledge base and CRM records |
 | [`fleet/insights_load.py`](fleet/insights_load.py) | Optional Insights load profile: labelled waste patterns, metered through `fleet/llm.py` |
+| [`seed_insights.py`](seed_insights.py) | Optional Insights seeder: synthetic, backdated metering records sent straight to Revenium (no LLM calls) |
 
 No agent framework is used. Prompts and replies are **never sent to Revenium**, because `REVENIUM_CAPTURE_PROMPTS=false`. Only token counts and metadata are sent.
 
@@ -316,5 +317,8 @@ python run_fleet.py               # full demo: 9 tickets through 4 agents
 python run_fleet.py --tickets 2   # only the first 2 tickets
 python run_fleet.py --check       # setup check: one short call per model
 python run_fleet.py --insights-load --rounds 2   # optional: Insights load profile, 29 calls per round (max 10 rounds)
+python seed_insights.py            # optional: Insights seeder dry run, sends nothing
+python seed_insights.py --fire     # sends 6,416 synthetic records (~$1,800 synthetic spend; sandbox tenant only)
+python seed_insights.py --verify   # starts an Insights run and reports findings per scenario
 python run_fleet.py --help        # all options
 ```

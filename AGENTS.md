@@ -5,8 +5,8 @@ You are helping a person set up and run the Revenium Agent Fleet Demo. Follow [R
 ## Hard rules
 
 1. **Never handle API keys.** Never ask for a key in chat. Never read, print, `cat`, `grep` or summarize `.env`, and never write a key value into any file. If a key is missing or wrong, tell the person which variable to fix and let them edit `.env` themselves.
-2. **Ask before spending money.** Every run makes real, paid LLM calls. Get the person's go-ahead before running anything except `python run_fleet.py --help`.
-3. **Don't change the demo code** (`run_fleet.py`, `fleet/`) to make a run succeed. Every supported fix is a setting in `.env`, which the person edits. The code is what the person is evaluating.
+2. **Ask before spending money.** Every run makes real, paid LLM calls. Get the person's go-ahead before running anything except `python run_fleet.py --help`, `python seed_insights.py --help` and the seeder dry run (`python seed_insights.py` without `--fire` or `--verify`), which sends nothing.
+3. **Don't change the demo code** (`run_fleet.py`, `seed_insights.py`, `fleet/`) to make a run succeed. Every supported fix is a setting in `.env`, which the person edits. The code is what the person is evaluating.
 4. **Never retry paid commands in a loop.** If a run fails, stop, diagnose it with the table below, and ask before running again.
 
 ## Setup procedure
@@ -68,9 +68,19 @@ Give the person:
 
 Data appears in the Revenium dashboard about one minute after the run. The person checks the dashboard. You cannot see it.
 
-## Insights load mode (only when the person asks for it)
+## Surfacing Insights (only when the person asks for it)
 
-`python run_fleet.py --insights-load --rounds N` generates deliberately wasteful traffic so Revenium AI Insights has something to find. See [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md).
+Two tools give Revenium AI Insights something to find. See [docs/SURFACING-INSIGHTS.md](docs/SURFACING-INSIGHTS.md).
+
+`python seed_insights.py` seeds synthetic, backdated metering records:
+
+- The dry run (no flags) is free and safe. It sends nothing.
+- `--fire` makes no LLM calls and costs no provider money, but it writes 6,416 synthetic records with about $1,800 of synthetic list-price spend into the person's Revenium tenant. That spend shows up in cost dashboards and cannot be removed with this tool. Ask first, recommend a sandbox tenant, and pass `--yes` only after the person agrees (non-interactive shells need it).
+- `--verify` starts an Insights run in the tenant. Ask first.
+- Report the FOUND / not found lines as printed. Not found is not a failure.
+- Never re-run `--fire` to make a finding appear: each run adds another full set of synthetic spend.
+
+`python run_fleet.py --insights-load --rounds N` makes real, paid calls that show the patterns:
 
 - Run `--insights-load` only after the person agrees. Quote the call count first: each round makes 29 calls, and the preflight's `Estimated calls` line shows the exact total.
 - In this mode, yellow `✗ (expected)` lines and `max_tokens` warnings are deliberate. They are not failures.

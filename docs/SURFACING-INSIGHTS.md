@@ -1,43 +1,130 @@
 # Surfacing Revenium AI Insights from a test tenant
 
-Revenium AI Insights runs a set of investigators over your metered traffic and reports waste: retries, errors, oversized models, cut-off replies, and similar problems. A non-production tenant usually has too little traffic, and traffic that is too clean, for any investigator to find something. This repo ships an opt-in load profile that produces the patterns each investigator looks for, using the same metering code as the demo fleet. Generate that traffic over several days, then trigger an Insights run over the same window.
+Revenium AI Insights runs a set of investigators over your metered traffic and reports waste: retries, errors, outdated models, cut-off replies, runaway spend and similar problems. Each investigator only reports a finding once a pattern reaches a minimum volume and dollar amount. A quiet non-production tenant never gets there, and real LLM calls cannot get there affordably.
 
-## Caveat: detection thresholds are not published
+This repo offers two tools:
 
-Revenium has not published to us the exact detection thresholds or minimum volumes each investigator needs. The investigator map below says what each investigator looks for, based on its name and purpose. It does not guarantee that a pattern triggers a finding. A given Insights run may report nothing.
+- **`seed_insights.py` (recommended).** Posts synthetic, backdated metering records straight to Revenium, sized to reach each investigator's minimums. No LLM calls.
+- **`run_fleet.py --insights-load`.** Makes real, paid LLM calls that show each pattern on real metered traffic, at volumes too small to trigger findings.
 
-The time-series investigators (spend trajectory, unit economics drift, dormant spend) compare periods, so they need traffic spread across several days. This repo has no backfill: Revenium timestamps each record when the call happens, so you cannot create last week's traffic today.
+## Seed synthetic Insights data (recommended)
 
-## Run the load profile
+`seed_insights.py` builds synthetic completion records and posts them to the Revenium metering API with the metering key the demo already uses (`REVENIUM_METERING_API_KEY`). It makes no LLM calls and needs no provider keys. Timestamps are backdated up to 90 days, so the time-series investigators get their history in one run.
+
+> **Warning: `--fire` writes synthetic spend into your tenant.** A full run sends **6,416 records with about $1,800 of synthetic spend at list prices**. That spend appears in the tenant's cost dashboards, customer reports and model reports, exactly like real usage. This tool cannot delete it. **Use a sandbox tenant, never production.**
+
+### Three steps
+
+1. **Dry run (free, sends nothing).** Builds every record and prints, per scenario, the record count, the date span, the estimated list-price spend and the investigator it targets.
+
+   ```bash
+   python seed_insights.py
+   ```
+
+2. **Send the records.** Prints the synthetic-spend warning with your masked key and the metering URL, then asks you to type `yes` (or pass `--yes`). At the default 10 records per second, a full run takes about 11 minutes.
+
+   ```bash
+   python seed_insights.py --fire
+   ```
+
+3. **Verify.** Starts an Insights run and reports which scenarios produced findings.
+
+   ```bash
+   python seed_insights.py --verify --tag <tag printed by --fire>
+   ```
+
+   Or do both in one go: `python seed_insights.py --fire --verify`. It waits 90 seconds for ingestion before it starts the Insights run.
+
+### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--fire` | off | Send the records. Without it, the script is a dry run |
+| `--yes` | off | With `--fire`: skip the `yes` prompt. Required in non-interactive shells |
+| `--verify` | off | Start an Insights run and report FOUND / not found per scenario |
+| `--detectors` | all | Comma list of scenario keys, for example `retry-waste,fan-out` |
+| `--tps` | 10 | Records sent per second (maximum 50) |
+| `--period-days` | 30 | `--verify`: how many days back the Insights run looks (1–90) |
+| `--environment` | `insights-seed` | Environment label on every record |
+| `--tag` | `seed-YYYYMMDD-xxxx` | Run tag on agents, error reasons and names. Pass the same tag to `--verify` to see whether findings mention it |
+
+Exit codes: `0` means success (a dry run, a full delivery, or a completed Insights run even when some scenarios are not found). `1` means a missing or rejected key, an invalid URL, any record that failed to send, or an Insights run that failed or timed out. `130` means you pressed Ctrl-C.
+
+Each record is sent exactly once, with no retries. If some fail, the script prints up to five failures and exits `1`. Fix the cause before you send again, because a second `--fire` adds another full set of synthetic spend.
+
+### How to recognise seeded data
+
+- Environment `insights-seed` and trace type `insights-seed`
+- Product `Insights Seed`
+- Organizations and trace names that start with `Insights Seed –`, for example `Insights Seed – dominant customer (seed-20261120-ab12)`
+- Agent names, error reasons and names that end in the run tag `seed-YYYYMMDD-xxxx`
+
+## Investigator map
+
+Revenium does not publish exact detection thresholds. The volumes below are what the seeder sends, sized to clear each investigator's known minimums. They do not guarantee a finding: a given Insights run may still report nothing for some scenarios.
+
+| Investigator id | Seeder scenario (`--detectors` key) | What is seeded (minimum volume) | Real-call pattern (`--insights-load`) |
+|---|---|---|---|
+| `agent-graph-amplification` | `fan-out` | A 12-deep parent chain, 12 fan-out traces (3 with 15 children, 9 with 3) and a 6-step loop between two agents; 102 records. **Computed hourly** from the hour that just completed, so the rows are stamped inside the current UTC hour and sent first | `fan-out` |
+| `error-concentration-v1` | `error-concentration` | 600 errors, 75% on one agent, unique error reason | `error-concentration` |
+| `outdated-model-versions-v1` | `outdated-model` | 1,000 calls (≥200 required) on `gpt-4o`, about 120M input tokens | `outdated-model` |
+| `prompt-cache-miss-v1` | `prompt-cache-miss` | 600 calls at 125K input tokens with zero cache reads or writes, plus 150 smaller calls the week before | `bloated-context` |
+| `retry-waste` | `retry-waste` | ≥10 retries above a 5% retry rate, retry rows ≥ $50 (40 records) | `retry-waste` |
+| `model-task-fit` | `model-task-fit` | Same agent and task on two models, 160 calls each: 2.5% failures on one, 30% failures or retries on the other | `model-task-fit` |
+| `model-awareness-v1` | `model-awareness` | 140 calls (≥120 required) on `claude-3-5-sonnet-latest` | `model-task-fit`, `outdated-model` |
+| `subscriber-concentration` | `customer-concentration` | 12 organizations, one with about 98% of the spend; 330 records | Globex carries most of every round |
+| Credential usage spike (category `credential_spike`) | `credential-spike` | One credential: 7 calls a day for 30 days, then 32 a day for 30 days (more than 3×); 1,170 records | none |
+| `max-tokens-cutoff-v1` | `max-tokens-cutoff` | 80 `TOKEN_LIMIT` rows of 120. **This one may not fire:** the metering API takes the `TOKEN_LIMIT` stop reason, and this investigator may only recognise provider-native stop reasons | `max-tokens-cutoff` |
+| `dormant-spend-v1` | `dormant-spend` | An agent with about $38 of spend and no outcomes (120 records), plus a customer active 30–90 days ago and silent since (140 records) | none |
+| `spend-trajectory-v1` | `spend-trajectory` | 8 jobs a day for 28 days, then 22 a day for 30 days at a flat cost per job; 884 records | none |
+| `unit-economics-drift-v1` | `unit-economics-drift` | 10 jobs a day for 28 days, then 14 a day for 30 days at about 17× the cost per job; 700 records | none |
+| `context-ratio-anomaly` | not seeded | n/a | `bloated-context` |
+| `provider-deprecated-model-v1` | not seeded | n/a | `outdated-model` with `INSIGHTS_LEGACY_*` set to a deprecated model |
+
+You can list the investigators your tenant runs with the Revenium API/MCP tool `get_ai_insights`, action `list_investigators`.
+
+## Check the results
+
+`--verify` calls `POST /api/v2/insights/runs` on the Revenium app. For the default API address (`https://api.revenium.ai`) that is `https://app.revenium.ai`. If your tenant uses another address, set `REVENIUM_INSIGHTS_APP_URL` in `.env`. The script then:
+
+- follows a run that is already active (HTTP 409) instead of starting a second one; that run's period may differ
+- polls the run every 15 seconds, for up to 20 minutes
+- prints the finding categories and a FOUND / not found line per selected scenario
+- exits `0` when the run completes, even if some scenarios are not found
+
+It authenticates with `REVENIUM_INSIGHTS_API_KEY` when set, otherwise with the metering key. If the Insights API rejects the metering key, set `REVENIUM_INSIGHTS_API_KEY` to a key that can start Insights runs.
+
+Period guidance:
+
+- The default period is 30 days, which covers every scenario.
+- Per-call scenarios (error concentration, outdated model, prompt cache miss, retry waste, model-task fit, model awareness) are stamped within the last 7 days. If one is missing, run `python seed_insights.py --verify --period-days 7 --tag <tag>`.
+- For `fan-out`, verify again after the next full UTC hour.
+- Do not filter the run by organization; that removes the customer-concentration signal.
+
+**In the Revenium app:** open AI Insights, start a new run over the same period, and leave the organization filter empty. Labels in the app may differ from the ones used here.
+
+**Through the Revenium API / MCP tools:** call `manage_ai_insights` with action `trigger_run`, `period_start` and `period_end` (ISO 8601 or `yyyy-MM-dd`, UTC), and optional filters such as `filter_environment` (`insights-seed`) or `filter_trace_type`. The run is asynchronous: poll `get_ai_insights` with action `get_run` and the returned `run_id` until the status is `completed`, `partial`, `failed` or `cancelled`, then read the findings. Check the current parameter schema first, for example with `tool_introspection`, action `get_tool_metadata`.
+
+## AWS Bedrock
+
+The seeded records are provider-agnostic. Insights reads the same metering fields whether a record came from Anthropic, OpenAI or Bedrock through the Revenium SDK, so the findings show what Bedrock traffic at that volume would get.
+
+- Keep the seeded model ids for `outdated-model` (`gpt-4o`) and `model-awareness` (`claude-3-5-sonnet-latest`). Those investigators need Revenium to know a newer successor model.
+- To make other scenarios look like your Bedrock traffic, copy the provider and model strings from one of your real Bedrock records in Revenium into that scenario's builder in `seed_insights.py`. Not every Bedrock model id has been tested against every investigator.
+
+## See the patterns on real calls (`--insights-load`)
+
+This is the secondary path. Real-call volumes are below the detection minimums, so use the load mode to see what each pattern looks like on real, metered calls, not to trigger findings. The seeder's backdated time-series scenarios replace the multi-day schedule this mode would otherwise need.
 
 ```bash
 python run_fleet.py --insights-load --rounds 2
 ```
 
-- `--rounds` defaults to 2. The maximum is 10, and the command refuses larger values before it loads `.env` or makes any call.
-- Each round makes **29 LLM calls per round**. Two rounds make 58 calls; ten rounds make 290.
-- Before any paid call, the preflight prints the exact count (`Estimated calls`), the hot customer's share, the deliberately failing model, the legacy models, and the model used for the model-task-fit pattern.
-- The expensive responder model (`MODEL_RESPONDER`, default `claude-sonnet-5-5`) handles 12 of the 29 calls in each round: 3 baseline replies, 3 retried drafts, 1 cut-off reply, 2 classifications in the model-task-fit pattern, and 3 calls that each send a roughly 7,000-token handbook. Those 12 calls account for most of each round's cost.
-
-Every call carries:
-
-| Field | Value |
-|---|---|
-| Trace type | `insights-load` |
-| Agentic job type | `insights_load` |
-| Environment | `REVENIUM_ENVIRONMENT` from `.env` (default `demo`) |
-| Product | `AI Support Triage` |
-| Organizations | `Demo – Globex Corporation` (most traffic), `Demo – Initech`, `Demo – Umbrella Health` |
-| Agents and task types | The fleet's own: `classifier`, `researcher`, `responder`, `qa-reviewer`; `ticket-classification`, `kb-research`, `response-drafting`, `qa-review` |
-
-Some of the output is deliberate:
-
-- Each round prints two yellow `✗ (expected)` lines. The error-concentration pattern calls a model that does not exist.
-- The max-tokens-cutoff pattern prints `Warning: ... hit max_tokens` lines.
-
-Exit codes are the same as the fleet's: `0` means success (the deliberate failures do not count), `1` means an unexpected provider failure or failed metering delivery, and `130` means Ctrl-C. The last line must be `Metering OK: sent=N failed=0 unsent=0`.
-
-Three settings in `.env.example` control the deliberate models:
+- `--rounds` defaults to 2 and is capped at 10. Each round makes **29 LLM calls**; the preflight prints the exact count before any paid call.
+- The expensive responder model (`MODEL_RESPONDER`) handles 12 of the 29 calls per round and most of the cost.
+- Every call carries trace type `insights-load`, agentic job type `insights_load`, product `AI Support Triage`, the demo organizations (`Demo – Globex Corporation` with most traffic, `Demo – Initech`, `Demo – Umbrella Health`) and the fleet's own agents and task types.
+- Some output is deliberate: two yellow `✗ (expected)` lines per round (a model that does not exist) and `Warning: ... hit max_tokens` lines.
+- Exit codes match the fleet's: `0` success (deliberate failures do not count), `1` an unexpected failure or failed metering delivery, `130` Ctrl-C. The last line must be `Metering OK: sent=N failed=0 unsent=0`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -45,143 +132,30 @@ Three settings in `.env.example` control the deliberate models:
 | `INSIGHTS_LEGACY_ANTHROPIC_MODEL` | `claude-haiku-4-5` | Older Anthropic model for the outdated-model pattern |
 | `INSIGHTS_LEGACY_OPENAI_MODEL` | `gpt-4o-mini` | Older OpenAI model for the outdated-model pattern |
 
-## Investigator map
+The patterns live in [`fleet/insights_load.py`](../fleet/insights_load.py). Each is one function plus one entry in its `PATTERNS` table:
 
-| Investigator id | Display name | What it looks for (our reading) | How this repo produces it | Bedrock porting note |
-|---|---|---|---|---|
-| `agent-graph-amplification` | Excess agent calls (fan-out/circular) | Traces with more agent calls than the work needs: duplicate branches and agents calling each other in loops | `fan-out` pattern, `fan_out()` | Keep the `parent_transaction_id` chaining; it is plain metadata |
-| `context-ratio-anomaly` | Context Ratio Anomaly | Calls whose input is far larger than their output | `bloated-context` pattern, `bloated_context()` | Same: a large system prompt and a one-sentence answer |
-| `error-concentration-v1` | Error Concentration | Failed calls clustered on one agent or model | `error-concentration` pattern, `error_concentration()` | An unknown Bedrock model id fails the same way, but confirm ERROR records arrive (see [Porting to Bedrock](#porting-to-bedrock)) |
-| `outdated-model-versions-v1` | Outdated Model Versions | Traffic on older model versions when newer ones exist | `outdated-model` pattern, `outdated_model()` | Use an older Claude model id your account can still call |
-| `model-awareness-v1` | Model Awareness | Model choice that does not match the work. Fed indirectly by the `model-task-fit` and `outdated-model` patterns | `model_task_fit()` and `outdated_model()` | Follows the two patterns it is fed by |
-| `model-task-fit` | Model Task Fit | An expensive model doing simple work, such as classification | `model-task-fit` pattern, `model_task_fit()` | Point the classifier at your largest Claude model id |
-| `prompt-cache-miss-v1` | Prompt Cache Miss | A large, identical prompt prefix sent repeatedly without prompt caching | `bloated-context` pattern, `bloated_context()` | Send the handbook as a plain system string with no cache point |
-| `retry-waste` | Retry Waste | The same step repeated within one trace (`retry_number` above 0) | `retry-waste` pattern, `retry_waste()` | Same metadata and loop |
-| `spend-trajectory-v1` | Spend Trajectory | Spend that grows from one period to the next | Schedule recipe: ramp the rounds over several days | Run the same schedule against Bedrock |
-| `subscriber-concentration` | Subscriber Concentration | One customer or subscriber producing most of the traffic | The `customers` column of the pattern table: 25 of the 29 calls in each round are Globex's, from one subscriber (`marta.kessler@globex.example`). Do **not** filter the Insights run by organization, or the comparison disappears | Keep the same customer mix in the metadata |
-| `unit-economics-drift-v1` | Unit Economics Drift | Cost per unit of work (per trace or job) rising over time | Schedule recipe: switch the classifier to the expensive model from day 5 | Same recipe with Bedrock model ids |
-| `dormant-spend-v1` | Dormant and Underused Spend | Customers, products or workloads that had spend and then went quiet | Schedule recipe: the normal fleet (trace type `support-triage`, and the only traffic for `Demo – Acme Rockets`) runs on days 1–3 only | Same recipe |
-| `max-tokens-cutoff-v1` | Responses Cut Off by Max Tokens Limit | Replies that stop because they hit the max tokens limit | `max-tokens-cutoff` pattern, `max_tokens_cutoff()` | Pass the same small `max_tokens` |
-| `provider-deprecated-model-v1` | Provider-deprecated model in production use | Calls to models the provider has deprecated | `outdated-model` pattern, `outdated_model()`, if `INSIGHTS_LEGACY_*` names a deprecated model | See the note below the table |
+- **baseline:** a classifier and a responder call per customer. Healthy traffic to compare against.
+- **retry-waste:** a classifier root, then three identical responder drafts with `retry_number` 0, 1 and 2.
+- **error-concentration:** two researcher calls on `INSIGHTS_ERROR_MODEL`; both fail and send ERROR records with zero tokens.
+- **max-tokens-cutoff:** two calls with `max_tokens` 64 that ask for long answers, so both stop at the limit.
+- **model-task-fit:** two classifications on the responder's expensive model.
+- **outdated-model:** a classifier call on `INSIGHTS_LEGACY_ANTHROPIC_MODEL` and a researcher call on `INSIGHTS_LEGACY_OPENAI_MODEL`. Set either to a model on the provider's deprecation list to feed `provider-deprecated-model-v1`.
+- **bloated-context:** three responder calls that each send a roughly 7,000-token handbook as a plain system string, with no cache requested, for a one-sentence answer.
+- **fan-out:** a classifier root, three identical researcher calls under it, and a four-call QA ↔ researcher loop.
 
-**Provider-deprecated model.** Set `INSIGHTS_LEGACY_ANTHROPIC_MODEL` or `INSIGHTS_LEGACY_OPENAI_MODEL` to a model on that provider's deprecation list that still serves requests. The investigator's display name says "in production use", so it may only look at production traffic; we do not know. Do not relabel non-production traffic as production just to trigger it.
+### Porting the real-call patterns to Bedrock
 
-You can list the investigators your tenant runs with the Revenium API/MCP tool `get_ai_insights`, action `list_investigators`.
+Keep the agent names, task types, trace type and every `usage_metadata` key. Change only the client and the model ids. These facts come from the README of the Revenium Python SDK 0.14.0 (sections "AWS Bedrock" and "Calls the SDK does not meter").
 
-## The patterns
-
-All patterns live in [`fleet/insights_load.py`](../fleet/insights_load.py). Each is one function plus one entry in the `PATTERNS` table, which names the investigators it feeds. Every call goes through `llm.build_usage_metadata` and `llm.complete` in [`fleet/llm.py`](../fleet/llm.py), with `trace_type="insights-load"`. Each pattern run is its own trace and agentic job, with id `<run id>-r<round>-<pattern>-<customer>`.
-
-### baseline
-
-`baseline_trace()`. Healthy traffic to compare against; it feeds no investigator directly. Two calls per customer, for Globex, Initech and Umbrella: `classifier` on its configured model, then `responder` (reply of up to 80 words) with the classifier call as its parent.
-
-### retry-waste
-
-`retry_waste()`. Four calls: a `classifier` root, then three identical `responder` "Draft reply" calls. All three have the root as parent and `retry_number` 0, 1 and 2. The story is a strict validator that rejects the first two drafts. Feeds `retry-waste`.
-
-### error-concentration
-
-`error_concentration()`. Two `researcher` calls on `INSIGHTS_ERROR_MODEL` with `retry_number` 0, then 1. Both fail on purpose. Each sends one ERROR record with zero tokens, and the run prints them as `✗ (expected)`. Feeds `error-concentration-v1`.
-
-### max-tokens-cutoff
-
-`max_tokens_cutoff()`. Two calls with `max_tokens` set to 64: a `responder` asked for a thorough 350-word reply (Anthropic), and a `qa-reviewer` asked for a detailed, itemized review (OpenAI). Both stop at the limit. Feeds `max-tokens-cutoff-v1`.
-
-### model-task-fit
-
-`model_task_fit()`. Two `classifier` calls with task type `ticket-classification`, on two different Globex tickets, using the responder's model (`MODEL_RESPONDER`) instead of the classifier's. Feeds `model-task-fit` and `model-awareness-v1`.
-
-### outdated-model
-
-`outdated_model()`. A `classifier` call on `INSIGHTS_LEGACY_ANTHROPIC_MODEL`, then a `researcher` call on `INSIGHTS_LEGACY_OPENAI_MODEL` with the classifier call as its parent. Feeds `outdated-model-versions-v1`, `provider-deprecated-model-v1` and `model-awareness-v1`.
-
-### bloated-context
-
-`bloated_context()`. Three `responder` calls, each on a different Globex ticket, asking for one sentence that names the applicable handbook section. The system prompt is `HANDBOOK`: a fixed support handbook of 28,115 characters (about 7,000 tokens) built from the demo's knowledge base, past tickets, CRM plans and generated policy clauses. It goes in as a plain string, so no prompt cache is ever requested. Feeds `prompt-cache-miss-v1` and `context-ratio-anomaly`.
-
-### fan-out
-
-`fan_out()`. Eight calls: a `classifier` root; three identical `researcher` calls, each with the root as parent; then a four-call loop (`qa-reviewer` → `researcher` → `qa-reviewer` → `researcher`) in which each call's parent is the call before it. The story is a QA agent that keeps sending the facts back. Feeds `agent-graph-amplification`.
-
-## Porting to Bedrock
-
-Keep the agent names, task types, trace type and every `usage_metadata` key. Change only the client and the model ids. The facts below come from the README of the Revenium Python SDK 0.14.0 (`revenium-python-sdk`, sections "AWS Bedrock" and "Calls the SDK does not meter").
-
-- **Two ways to meter Claude on Bedrock.** Use `anthropic.AnthropicBedrock` with the same `usage_metadata=` keyword this repo uses; it is metered once `revenium_middleware.anthropic` is imported. Or call `boto3.client("bedrock-runtime")` directly (`invoke_model`, `invoke_model_with_response_stream`, `converse`, `converse_stream`) and set `REVENIUM_BEDROCK_TRANSPORT=1`.
-- **Only Claude models are metered on Bedrock.** Raw boto3 calls to other Bedrock model families send no usage record. This repo runs the `researcher` and `qa-reviewer` roles on OpenAI; map those roles onto Claude models when you port.
-- **Check the error pattern.** A call the provider refuses normally sends one record with stop reason `ERROR` and zero tokens. The SDK README also says that "calls served through the Bedrock fast path ... send no error record". Before you rely on the error-concentration pattern, make one call to an invalid model id and confirm that an ERROR record appears in Revenium.
-- **Bedrock model ids** look like `anthropic.claude-...` or, for cross-Region inference profiles, `us.anthropic.claude-...`. Set them through `MODEL_*` and `INSIGHTS_LEGACY_ANTHROPIC_MODEL`.
-- **Prompt caching.** Claude prompt caching only applies when a request asks for it (a `cache_control` block on the Messages API). The bloated-context pattern works by never asking, so keep it that way when you port.
-
-We make no other claims about Bedrock behavior here.
-
-## Schedule it over several days
-
-The per-call investigators can fire after one run. The time-series investigators need a trend, so spread the traffic over a week:
-
-| Day | Load profile (3 times a day) | Normal fleet (once a day) | `.env` change |
-|---|---|---|---|
-| 1 | `--rounds 1` | yes | none |
-| 2 | `--rounds 1` | yes | none |
-| 3 | `--rounds 2` | yes | none |
-| 4 | `--rounds 2` | no | none |
-| 5 | `--rounds 3` | no | set `MODEL_CLASSIFIER` to the responder model |
-| 6 | `--rounds 3` | no | (keep) |
-| 7 | `--rounds 3` | no | (keep), then revert after the window |
-
-- **Spend trajectory:** the rounds ramp from 1 to 3, so daily load spend roughly triples (87 calls on day 1, 261 calls on days 5–7).
-- **Dormant spend:** the normal fleet runs only on days 1–3. Afterwards, trace type `support-triage` and `Demo – Acme Rockets` go quiet. Acme never appears in the load profile, so its spend stops completely.
-- **Unit economics drift:** from day 5, the person running the test edits `.env` to set `MODEL_CLASSIFIER` to the responder model (for example `claude-sonnet-5-5`). Cost per trace rises because every classification now runs on the expensive model. Set it back when the window ends.
-
-Over the 7 days, the load profile makes 1,305 calls, and the fleet adds 45 calls a day on days 1–3.
-
-A crontab for days 1–2 (`crontab -e`). Use absolute paths; `run_fleet.py` finds `.env` next to itself:
-
-```cron
-# Revenium Insights load profile: 08:00, 13:00 and 18:00 every day
-0 8,13,18 * * * /path/to/agent-fleet-demo/.venv/bin/python /path/to/agent-fleet-demo/run_fleet.py --insights-load --rounds 1 >> /path/to/agent-fleet-demo/insights-load.log 2>&1
-# Normal fleet once a day: delete this line after day 3
-30 9 * * * /path/to/agent-fleet-demo/.venv/bin/python /path/to/agent-fleet-demo/run_fleet.py >> /path/to/agent-fleet-demo/insights-load.log 2>&1
-```
-
-Change `--rounds 1` to `--rounds 2` on day 3 and to `--rounds 3` on day 5. The log contains only masked keys (first and last four characters), the same output you see in the terminal.
-
-On Windows, create the same three daily triggers in Task Scheduler, with `.venv\Scripts\python.exe` as the program and `run_fleet.py --insights-load --rounds 1` as the arguments.
-
-When the window ends, remove the cron lines (or Task Scheduler tasks). Every scheduled run spends money.
-
-## Trigger an Insights run on demand
-
-Insights runs analyze a time period. Set the period to cover the whole load window.
-
-**In the Revenium app:** open AI Insights, start a new run, set the period to cover the load window, and choose filters. Labels in the app may differ from the ones used here.
-
-**Through the Revenium API / MCP tools:**
-
-1. Call `manage_ai_insights` with action `trigger_run`. Required: `period_start` and `period_end`, as ISO 8601 or `yyyy-MM-dd` (UTC). Optional filters:
-   - `filter_agent` (list)
-   - `filter_product_id` (list of product ids)
-   - `filter_trace_type` (list)
-   - `filter_consuming_org_id` (list of organization ids)
-   - `filter_environment` (string)
-   - `exclude_investigator_ids` (list)
-2. The run is asynchronous. `trigger_run` returns a run id with status `running`.
-3. Poll `get_ai_insights` with action `get_run` and that `run_id` until the status is `completed`, `partial`, `failed` or `cancelled`. Then read the findings.
-
-Before you call it, check the current parameter schema, for example with `tool_introspection`, action `get_tool_metadata`, for `manage_ai_insights`.
-
-We recommend two runs over the same period:
-
-1. **Per-call investigators:** `filter_trace_type` = `["insights-load"]`, plus `filter_environment` if you set one.
-2. **Time-series investigators:** `filter_environment` only, with no trace-type filter, so spend trajectory, unit economics drift and dormant spend also see the normal fleet traffic (`support-triage`).
-
-Do not filter either run by organization; that removes the subscriber-concentration signal.
+- **Two ways to meter Claude on Bedrock.** Use `anthropic.AnthropicBedrock` with the same `usage_metadata=` keyword this repo uses, or call `boto3.client("bedrock-runtime")` directly and set `REVENIUM_BEDROCK_TRANSPORT=1`.
+- **Only Claude models are metered on Bedrock.** Map the `researcher` and `qa-reviewer` roles onto Claude models when you port.
+- **Check the error pattern.** The SDK README says calls served through the Bedrock fast path send no error record. Make one call to an invalid model id and confirm an ERROR record appears before you rely on it.
+- **Model ids** look like `anthropic.claude-...` or `us.anthropic.claude-...`. Set them through `MODEL_*` and `INSIGHTS_LEGACY_ANTHROPIC_MODEL`.
+- **Prompt caching** only applies when a request asks for it. The bloated-context pattern works by never asking.
 
 ## Side effects and clean-up
 
-- **Organizations:** the load profile uses the demo's existing `Demo – Globex Corporation`, `Demo – Initech` and `Demo – Umbrella Health` organizations. The normal fleet also creates `Demo – Acme Rockets`. All are fictional.
-- **Invalid model:** `gpt-insights-load-missing-model` (or your `INSIGHTS_ERROR_MODEL`) appears in model lists with ERROR records and zero tokens.
-- **Legacy models:** `claude-haiku-4-5` and `gpt-4o-mini` (or your `INSIGHTS_LEGACY_*` values) appear in model lists and cost reports.
-- **Jobs:** each pattern run creates a job of type `insights_load`. These jobs never get a business outcome; only the normal fleet reports outcomes.
-- **Stopping:** delete the cron lines or Task Scheduler tasks, revert any `MODEL_CLASSIFIER` change in `.env`, and use a non-production tenant or environment so this traffic stays separate from real usage.
+- **Seeder organizations and agents:** each `--fire` creates organizations named `Insights Seed – … (<tag>)` and agents ending in the tag. A new tag creates a new set.
+- **Seeder spend:** about $1,800 of synthetic list-price spend per full run, visible in cost dashboards and customer and model reports. Nothing in this repo can delete it.
+- **Load-mode data:** `--insights-load` uses the demo organizations, adds the invalid model (ERROR records with zero tokens) and the legacy models to model lists, and creates jobs of type `insights_load` that never get an outcome. It is real, paid LLM usage.
+- **Recommendation:** run both tools against a sandbox tenant, never production, so this data stays separate from real usage.
