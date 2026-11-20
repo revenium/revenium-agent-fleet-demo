@@ -3,3 +3,5 @@ anthropic==2.6.0
 openai==3.46.0
 python-dotenv==1.2.4
 rich==15.0.0
+# seed_insights.py imports httpx directly; revenium-python-sdk already installs this version.
+httpx==0.28.1
