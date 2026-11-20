@@ -335,6 +335,76 @@ class VerifyKeyChoiceTests(Base):
         self.assertEqual(self.calls, [])
 
 
+class VerifyGuidanceTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.responder = verify_ok
+
+    def assert_guidance(self, key):
+        for phrase in ("rev_sk_ write key from the same tenant", "REVENIUM_WRITE_API_KEY",
+                       "Insights page", "last 30 days", "no filters"):
+            self.assertIn(phrase, self.text)
+        self.assertIn(mask(key), self.text)
+        self.assertNotIn(key, self.text)
+
+    def test_warns_when_key_is_not_rev_sk(self):
+        wrong = "hak_offline_wrong_slot_4321"
+        self.responder = lambda *a: (403, "forbidden")
+        with mock.patch.dict(os.environ, {"REVENIUM_WRITE_API_KEY": wrong}):
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assertIn("does not start with rev_sk_", self.text)
+        self.assertIn(mask(wrong), self.text)
+        self.assertNotIn(wrong, self.text)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_no_warning_for_rev_sk_key(self):
+        with mock.patch.dict(os.environ, {"REVENIUM_WRITE_API_KEY": WRITE_KEY}):
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 0)
+        self.assertNotIn("does not start with rev_sk_", self.text)
+
+    def test_403_explains_the_write_key_and_the_ui(self):
+        self.responder = lambda *a: (403, "forbidden")
+        with mock.patch.dict(os.environ, {"REVENIUM_WRITE_API_KEY": WRITE_KEY}):
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assert_guidance(WRITE_KEY)
+
+    def test_403_while_polling(self):
+        def responder(method, url, headers, body):
+            if method == "POST":
+                return 201, '{"id":"run-1"}'
+            return 403, "forbidden"
+
+        self.responder = responder
+        with mock.patch.dict(os.environ, {"REVENIUM_WRITE_API_KEY": WRITE_KEY}):
+            self.assertEqual(si.main(["--verify", "--detectors", "retry-waste"]), 1)
+        self.assert_guidance(WRITE_KEY)
+        self.assertIn("While polling", self.text)
+
+    def test_fire_then_verify_uses_each_key(self):
+        def responder(method, url, headers, body):
+            if url.endswith("/meter/v2/ai/completions"):
+                return 201, ""
+            return verify_ok(method, url, headers, body)
+
+        self.responder = responder
+        with mock.patch.dict(os.environ, {"REVENIUM_METERING_API_KEY": FAKE_KEY,
+                                          "REVENIUM_WRITE_API_KEY": WRITE_KEY}):
+            rc = si.main(["--fire", "--yes", "--verify", "--detectors", "retry-waste", "--tps", "50"])
+        self.assertEqual(rc, 0)
+        meter = [c for c in self.calls if c[1].endswith("/meter/v2/ai/completions")]
+        insights = [c for c in self.calls if "/api/v2/insights/runs" in c[1]]
+        self.assertTrue(meter)
+        self.assertTrue(insights)
+        self.assertEqual(len(meter) + len(insights), len(self.calls))
+        for method, _url, headers, _body in meter:
+            self.assertEqual(method, "POST")
+            self.assertEqual(headers.get("x-api-key"), FAKE_KEY)
+            self.assertNotIn("authorization", headers)
+        for _method, _url, headers, _body in insights:
+            self.assertEqual(headers.get("authorization"), f"Bearer {WRITE_KEY}")
+            self.assertNotIn("x-api-key", headers)
+
+
 ALL_KEYS = (
     "fan-out error-concentration outdated-model prompt-cache-miss retry-waste model-task-fit "
     "model-awareness customer-concentration credential-spike max-tokens-cutoff dormant-spend "
