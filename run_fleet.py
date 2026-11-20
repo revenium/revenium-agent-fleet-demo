@@ -22,6 +22,10 @@ from rich.text import Text
 
 OUTCOMES = ("DEFLECTED", "ESCALATED", "FAILED")
 REQUIRED_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "REVENIUM_METERING_API_KEY")
+# Insights load mode. The cap lives here because fleet/ may not be imported before .env loads;
+# fleet/insights_load.py checks its own MAX_ROUNDS again before any call.
+INSIGHTS_DEFAULT_ROUNDS = 2
+INSIGHTS_MAX_ROUNDS = 10
 
 console = Console(soft_wrap=True)
 
@@ -345,6 +349,97 @@ def run_fleet(run_id: str, limit) -> int:
     return 1 if failed or not status.healthy else 0
 
 
+def print_load_summary(results: list, run_id: str) -> None:
+    """Calls, errors and tokens per load pattern, traffic share per customer, where to look."""
+    from fleet import insights_load
+
+    console.rule("Summary")
+    table = Table(title="Calls per pattern", box=box.SIMPLE)
+    table.add_column("Pattern", no_wrap=True)
+    table.add_column("Investigators")
+    for name in ("Calls", "Expected errors", "Unexpected errors", "Input tok", "Output tok"):
+        table.add_column(name, justify="right")
+    for pattern in insights_load.PATTERNS:
+        mine = [r for r in results if r.pattern_key == pattern.key]
+        if not mine:
+            continue
+        calls = [c for r in mine for c in r.calls]
+        table.add_row(
+            Text(pattern.key),
+            Text(", ".join(pattern.investigators) or "-"),
+            Text(str(sum(r.attempted for r in mine))),
+            Text(str(sum(r.expected_errors for r in mine))),
+            Text(str(sum(1 for r in mine if r.error))),
+            Text(str(sum(c.input_tokens for c in calls))),
+            Text(str(sum(c.output_tokens for c in calls))),
+        )
+    console.print(table)
+
+    attempted = sum(r.attempted for r in results)
+    calls = [c for r in results for c in r.calls]
+    console.print(
+        f"Totals: {len(results)} traces · {attempted} LLM calls"
+        f" ({sum(r.expected_errors for r in results)} failed on purpose)"
+        f" · in={sum(c.input_tokens for c in calls)} out={sum(c.output_tokens for c in calls)}",
+        markup=False,
+        highlight=False,
+    )
+    orgs = {}
+    for r in results:
+        orgs[r.org] = orgs.get(r.org, 0) + r.attempted
+    share = " · ".join(
+        f"{org} {n} ({100 * n / attempted:.0f}%)" for org, n in orgs.items()
+    ) if attempted else "none"
+    console.print(f"Traffic share: {share}", markup=False, highlight=False)
+    for line in (
+        "Where to look in Revenium (data lands in about a minute):",
+        f'  Traces       trace type "{insights_load.TRACE_TYPE}", search {run_id}',
+        f"  Insights     trigger an Insights run over this time window, filtered to trace type "
+        f"{insights_load.TRACE_TYPE} (docs/SURFACING-INSIGHTS.md)",
+    ):
+        console.print(line, markup=False, highlight=False)
+
+
+def run_insights_load(run_id: str, rounds: int) -> int:
+    """Insights load mode: the labelled waste patterns in fleet/insights_load.py, `rounds` times."""
+    from fleet import insights_load, llm
+
+    for label, value in insights_load.preflight_rows(rounds):
+        console.print(f"{label:<16} {value}", markup=False, highlight=False)
+
+    def on_trace(round_no, pattern, customer):
+        console.print(f"━━ r{round_no} · {pattern.key} · {customer.org}", style="bold",
+                      markup=False, highlight=False)
+
+    def on_error(pattern_key, agent, provider, model, reason, expected):
+        if expected:  # deliberate: the error-concentration pattern calls a model that does not exist
+            console.print(f"✗ (expected) {agent} {provider}/{model} {reason}", style="yellow",
+                          markup=False, highlight=False)
+        else:
+            console.print(f"✗ {agent} {provider}/{model} {reason}", style="red",
+                          markup=False, highlight=False)
+
+    results = []
+    interrupted = False
+    try:
+        insights_load.run_load(run_id, rounds, results, on_trace,
+                               lambda _key, result: print_call(result), on_error)
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("[yellow]Interrupted - flushing metering before exit[/yellow]")
+    finally:
+        # Every attempted call sends one record, the deliberate failures included.
+        status = llm.flush_and_status(sum(r.attempted for r in results), 15.0)
+        print_load_summary(results, run_id)  # on Ctrl-C: the traces finished so far
+        print_delivery(status, run_id)
+
+    if interrupted:
+        return 130
+    # Expected (deliberate) errors never change the exit code.
+    failed = any(r.error for r in results)
+    return 1 if failed or not status.healthy else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Revenium agent fleet demo")
     parser.add_argument(
@@ -359,9 +454,33 @@ def main(argv=None) -> int:
         metavar="N",
         help="fleet mode: process only the first N tickets (default: all)",
     )
+    parser.add_argument(
+        "--insights-load",
+        action="store_true",
+        help="opt-in: run the Revenium AI Insights load profile (deliberately wasteful, labelled "
+        "patterns; trace type insights-load); see docs/SURFACING-INSIGHTS.md",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"insights-load only: rounds to run (default {INSIGHTS_DEFAULT_ROUNDS}, max "
+        f"{INSIGHTS_MAX_ROUNDS}); the preflight prints the exact call count",
+    )
     args = parser.parse_args(argv)
     if args.tickets is not None and args.tickets < 1:
         parser.error("--tickets must be 1 or more")
+    # Insights load flags are validated here, before .env loads and before any paid call.
+    if args.rounds is not None and not args.insights_load:
+        parser.error("--rounds only works with --insights-load")
+    if args.insights_load and args.check:
+        parser.error("--insights-load cannot be combined with --check")
+    if args.insights_load and args.tickets is not None:
+        parser.error("--insights-load cannot be combined with --tickets")
+    if args.rounds is not None and not 1 <= args.rounds <= INSIGHTS_MAX_ROUNDS:
+        parser.error(f"--rounds must be between 1 and {INSIGHTS_MAX_ROUNDS}")
+    rounds = args.rounds or INSIGHTS_DEFAULT_ROUNDS
     # No flag runs the fleet; --check runs the smoke check and ignores --tickets.
 
     # .env must win over shell exports, and must load BEFORE the Revenium SDK is imported.
@@ -397,6 +516,8 @@ def main(argv=None) -> int:
         lambda msg: console.print(msg, style="bold red", markup=False, highlight=False)
     )
 
+    if args.insights_load:
+        return run_insights_load(run_id, rounds)
     if not args.check:
         return run_fleet(run_id, args.tickets)
 

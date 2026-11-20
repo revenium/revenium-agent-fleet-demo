@@ -38,6 +38,7 @@ def build_usage_metadata(
     parent_transaction_id: Optional[str] = None,
     retry_number: int = 0,
     response_quality_score: Optional[float] = None,
+    trace_type: Optional[str] = None,
 ) -> dict:
     """The metadata Revenium attaches to one LLM call."""
     metadata = {
@@ -45,7 +46,7 @@ def build_usage_metadata(
         "agent_version": config.AGENT_VERSION,
         "task_type": task_type,
         "trace_id": trace_id,
-        "trace_type": config.TRACE_TYPE,
+        "trace_type": trace_type or config.TRACE_TYPE,
         "trace_name": trace_name,
         "transaction_name": transaction_name,
         "parent_transaction_id": parent_transaction_id,
@@ -136,24 +137,31 @@ class LLMResult:
     stop_reason: Optional[str]
 
 
-def complete(agent: str, system: str, prompt: str, metadata: dict) -> LLMResult:
-    """Make one metered LLM call with the model configured for `agent`."""
+def complete(agent: str, system: str, prompt: str, metadata: dict, *,
+             model: Optional[str] = None, max_tokens: Optional[int] = None) -> LLMResult:
+    """Make one metered LLM call with the model configured for `agent`.
+
+    `model` and `max_tokens` override the configured model and config.MAX_TOKENS for this call
+    only. An override model must belong to the agent's provider.
+    """
     if agent not in config.AGENT_MODELS:
         known = ", ".join(config.AGENT_MODELS)
         raise ValueError(f"Unknown agent {agent!r}; known agents: {known}")
-    provider, model = config.AGENT_MODELS[agent]
+    provider, configured = config.AGENT_MODELS[agent]
+    model = model or configured
+    max_tokens = max_tokens or config.MAX_TOKENS
     call = _anthropic_call if provider == "anthropic" else _openai_call
     start = time.perf_counter()
-    text, response_id, tokens_in, tokens_out, stop_reason = call(model, system, prompt, metadata)
+    text, response_id, tokens_in, tokens_out, stop_reason = call(model, system, prompt, metadata, max_tokens)
     latency = time.perf_counter() - start
     return LLMResult(agent, provider, model, text, response_id, tokens_in, tokens_out, latency, stop_reason)
 
 
-def _anthropic_call(model: str, system: str, prompt: str, metadata: dict):
+def _anthropic_call(model: str, system: str, prompt: str, metadata: dict, max_tokens: int):
     effort = {} if model.startswith(config.NO_EFFORT_PREFIXES) else {"output_config": {"effort": "low"}}
     resp = _anthropic.messages.create(
         model=model,
-        max_tokens=config.MAX_TOKENS,
+        max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": prompt}],
         usage_metadata=metadata,  # added by revenium_middleware
@@ -163,11 +171,11 @@ def _anthropic_call(model: str, system: str, prompt: str, metadata: dict):
     return text, resp.id, resp.usage.input_tokens, resp.usage.output_tokens, resp.stop_reason
 
 
-def _openai_call(model: str, system: str, prompt: str, metadata: dict):
+def _openai_call(model: str, system: str, prompt: str, metadata: dict, max_tokens: int):
     effort = {} if model.startswith(config.NO_EFFORT_PREFIXES) else {"reasoning_effort": "low"}
     resp = _openai.chat.completions.create(
         model=model,
-        max_completion_tokens=config.MAX_TOKENS,
+        max_completion_tokens=max_tokens,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         usage_metadata=metadata,  # added by revenium_middleware
         **effort,
